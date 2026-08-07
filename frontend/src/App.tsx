@@ -139,6 +139,33 @@ function toolLabel(name: string): string {
   return TOOL_LABELS[name] ?? name;
 }
 
+/** Short activity phrase for the live chat status line ("round N of M · …"). */
+function toolPhase(name: string, input: unknown): string {
+  const args = input && typeof input === 'object' ? (input as Record<string, unknown>) : {};
+  switch (name) {
+    case 'run_python': {
+      const code = textValue(args.code).toLowerCase();
+      if (/reportlab|weasyprint|fpdf|typst|\.pdf/.test(code)) return 'writing the report';
+      if (/streamlit|nicegui|dash|http\.server|\.html?['"]/.test(code)) return 'building the web app';
+      return 'analyzing data';
+    }
+    case 'write_file':
+      return 'writing a file';
+    case 'read_file':
+      return 'reading a file';
+    case 'list_files':
+      return 'checking the workspace';
+    case 'start_webapp':
+      return 'launching the web app';
+    case 'stop_webapp':
+      return 'stopping the web app';
+    case 'register_artifact':
+      return 'publishing to the canvas';
+    default:
+      return 'working';
+  }
+}
+
 /** Extract a human-readable one-liner from the tool's input arguments. */
 function toolDetail(name: string, input: unknown): string {
   if (!input || typeof input !== 'object') return '';
@@ -184,6 +211,8 @@ export default function App() {
     execution,
     thinking,
     turnActive,
+    turnStep,
+    turnPhase,
     setSessionId,
     setConnection,
     addMessage,
@@ -204,6 +233,8 @@ export default function App() {
     appendExecutionOutput,
     setThinking,
     setTurnActive,
+    setTurnStep,
+    setTurnPhase,
     reset,
   } = useWorkbench();
   const socketRef = useRef<WebSocket | null>(null);
@@ -280,6 +311,20 @@ export default function App() {
         wb.setAssistantMessage(textValue(payload.content ?? payload.message ?? payload.text));
         wb.finishAssistant();
         break;
+      case 'turn_step': {
+        // One per agent round; drives the "round N of M · …" status line.
+        const step = Number(payload.step);
+        const maxSteps = Number(payload.max_steps);
+        if (Number.isFinite(step) && Number.isFinite(maxSteps) && maxSteps > 0) {
+          wb.setTurnStep({ step, maxSteps });
+          wb.setTurnPhase(wb.turnPhase || 'thinking');
+        }
+        break;
+      }
+      case 'wrap_up_nudge':
+        // The backend told the model to wrap up; say so while it winds down.
+        wb.setTurnPhase('wrapping up');
+        break;
       case 'tool_start': {
         const id = textValue(payload.id, newId('tool'));
         const rawName = textValue(payload.name ?? payload.tool, 'run_python');
@@ -290,6 +335,7 @@ export default function App() {
           detail: toolDetail(rawName, payload.input),
           startedAt: Date.now(),
         });
+        wb.setTurnPhase(toolPhase(rawName, payload.input));
         wb.setThinking(false);
         wb.updateExecution({ running: true });
         break;
@@ -305,6 +351,7 @@ export default function App() {
         // The LLM is composing its next step now; keeping the indicator alive
         // avoids a frozen-looking gap between tool result and next delta.
         wb.setThinking(true);
+        wb.setTurnPhase('thinking');
         break;
       }
       case 'execution': {
@@ -353,6 +400,8 @@ export default function App() {
         wb.updateExecution({ running: false });
         wb.setThinking(false);
         wb.setTurnActive(false);
+        wb.setTurnStep(null);
+        wb.setTurnPhase('');
         // A stopped run should not fire a queued follow-up; hand it back.
         if (pendingMessageRef.current) {
           setDraft(pendingMessageRef.current);
@@ -380,6 +429,8 @@ export default function App() {
         wb.updateExecution({ running: false });
         wb.setThinking(false);
         wb.setTurnActive(false);
+        wb.setTurnStep(null);
+        wb.setTurnPhase('');
         if (pendingMessageRef.current) {
           setDraft(pendingMessageRef.current);
           pendingMessageRef.current = null;
@@ -391,6 +442,8 @@ export default function App() {
         wb.updateExecution({ running: false });
         wb.setThinking(false);
         wb.setTurnActive(false);
+        wb.setTurnStep(null);
+        wb.setTurnPhase('');
         const queued = pendingMessageRef.current;
         if (queued && socketRef.current?.readyState === WebSocket.OPEN) {
           // Send the follow-up queued while the previous run was working.
@@ -527,6 +580,8 @@ export default function App() {
     setDraft('');
     // Tool steps belong to the turn that produced them; clear last turn's.
     clearTools();
+    setTurnStep(null);
+    setTurnPhase('');
     if (socketRef.current?.readyState === WebSocket.OPEN) {
       setThinking(true);
       setTurnActive(true);
@@ -662,6 +717,8 @@ export default function App() {
                 connected={connection === 'connected'}
                 thinking={thinking}
                 turnActive={turnActive}
+                turnStep={turnStep}
+                turnPhase={turnPhase}
                 onStop={stopRun}
                 onMinimize={() => {
                   setChatMinimized(true);
@@ -993,6 +1050,8 @@ function Chat({
   connected,
   thinking,
   turnActive,
+  turnStep,
+  turnPhase,
   onStop,
   onMinimize,
   datasets,
@@ -1010,6 +1069,8 @@ function Chat({
   connected: boolean;
   thinking: boolean;
   turnActive: boolean;
+  turnStep: WorkbenchState['turnStep'];
+  turnPhase: string;
   onStop: () => void;
   onMinimize: () => void;
   datasets: Dataset[];
@@ -1057,14 +1118,18 @@ function Chat({
                 <Message key={message.id} message={message} />
               ))}
             </div>
-            {thinking && (
-              <div className="thinking-indicator">
+            {(thinking || (turnActive && tools.some((tool) => tool.status === 'running'))) && (
+              <div className="thinking-indicator" aria-live="polite">
                 <div className="thinking-dots">
                   <span />
                   <span />
                   <span />
                 </div>
-                <span>Thinking…</span>
+                <span>
+                  {turnActive && turnStep
+                    ? `Round ${turnStep.step} of ${turnStep.maxSteps} · ${turnPhase || 'thinking'}`
+                    : 'Thinking…'}
+                </span>
               </div>
             )}
           </>

@@ -1,3 +1,4 @@
+import os
 import sys
 import types
 from pathlib import Path
@@ -117,6 +118,9 @@ async def test_agent_returns_tool_results_to_provider_once(tmp_path: Path):
     assert any(event["type"] == "assistant_message" and "1190.0" in event["content"] for event in events)
     trajectory = (tmp_path / "sessions" / "loop" / "trajectory.jsonl").read_text()
     assert trajectory.count('"type": "tool_start"') == 1
+    # The closing message must land in the audit trail, not only on the wire.
+    assert '"type": "assistant_message"' in trajectory
+    assert "1190.0" in trajectory
 
 
 class SetVariableProvider:
@@ -494,9 +498,18 @@ async def test_report_request_explains_why_no_pdf_reached_the_canvas(tmp_path: P
     assert "no PDF artifact was found in the sandbox workspace" in message["content"]
 
 
-def run_pdf_rescue(workspace: Path, working_directory: Path, monkeypatch) -> None:
+def run_pdf_rescue(
+    workspace: Path,
+    working_directory: Path,
+    monkeypatch,
+    scan_roots: tuple[Path, ...] = (),
+) -> None:
     monkeypatch.setenv("SANDBOX_WORKSPACE", str(workspace))
     monkeypatch.chdir(working_directory)
+    # Keep the scan hermetic: without this override the snippet would glob the
+    # host's real /tmp and pick up unrelated PDFs from outside the test.
+    roots = scan_roots or (working_directory,)
+    monkeypatch.setenv("SANDBOX_RESCUE_ROOTS", os.pathsep.join(str(root) for root in roots))
     # A clobbered WORKSPACE global is exactly the failure the snippet must survive.
     exec(compile(PDF_RESCUE_CODE, "<rescue>", "exec"), {"WORKSPACE": "/app"})
 
@@ -522,6 +535,21 @@ def test_pdf_rescue_leaves_workspace_files_untouched(tmp_path: Path, monkeypatch
 
     assert not (workspace / "whitepaper.pdf").exists()
     assert sorted(path.name for path in workspace.rglob("*.pdf")) == ["whitepaper.pdf"]
+
+
+def test_pdf_rescue_ignores_pdfs_outside_the_configured_scan_roots(tmp_path: Path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    working_directory = tmp_path / "app"
+    working_directory.mkdir()
+    stray = tmp_path / "stray"
+    stray.mkdir()
+    (stray / "scratch.pdf").write_bytes(b"%PDF-1.4 unrelated")
+
+    run_pdf_rescue(workspace, working_directory, monkeypatch)
+
+    assert not (workspace / "scratch.pdf").exists()
+    assert list(workspace.rglob("*.pdf")) == []
 
 
 def test_anthropic_history_maps_openai_tool_flow_to_content_blocks():
@@ -832,13 +860,13 @@ def _install_fake_openai(monkeypatch) -> _FakeResponsesAPI:
 
 
 @pytest.mark.asyncio
-async def test_openai_provider_always_uses_max_reasoning_effort(monkeypatch):
+async def test_openai_provider_uses_xhigh_reasoning_effort(monkeypatch):
     fake = _install_fake_openai(monkeypatch)
     provider = OpenAIProvider("key", "gpt-5.6-luna")
 
     _ = [item async for item in provider.stream([{"role": "user", "content": "hi"}], [])]
 
-    assert fake.requests[0]["reasoning"] == {"effort": "max"}
+    assert fake.requests[0]["reasoning"] == {"effort": "xhigh"}
 
 
 class _BothArtifactsProvider:
@@ -1064,6 +1092,28 @@ async def test_wrap_up_nudge_reaches_the_provider_before_the_cap(tmp_path: Path)
         message.get("role") == "tool" and WRAP_UP_NUDGE in str(message.get("content", ""))
         for message in nudged
     )
+
+
+@pytest.mark.asyncio
+async def test_turn_step_events_track_every_round_and_the_nudge(tmp_path: Path):
+    provider = EndlessExplorerProvider()
+    sandbox = FakeSandbox("progress", tmp_path / "workspace")
+    agent = Agent(sandbox, provider, "progress", tmp_path / "sessions")
+
+    try:
+        events = [event async for event in agent.turn("Analyze the data")]
+    finally:
+        await sandbox.close()
+
+    # The chat status line ("round N of M · …") is built from these events, so
+    # every provider round must announce itself, in order, against the cap.
+    steps = [event for event in events if event["type"] == "turn_step"]
+    assert [event["step"] for event in steps] == list(range(1, MAX_TURN_STEPS + 1))
+    assert all(event["max_steps"] == MAX_TURN_STEPS for event in steps)
+    nudges = [event for event in events if event["type"] == "wrap_up_nudge"]
+    assert [event["step"] for event in nudges] == [
+        MAX_TURN_STEPS - WRAP_UP_REMAINING_STEPS + 1
+    ]
 
 
 @pytest.mark.asyncio

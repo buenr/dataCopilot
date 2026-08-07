@@ -41,11 +41,19 @@ WRAP_UP_NUDGE = (
 # The kernel preloads WORKSPACE for convenience, but agent code can reassign it,
 # so this snippet resolves the real workspace from the sandbox environment. A
 # wrong destination would silently copy a rescued PDF back onto itself.
+# Scan roots default to known provider output locations (some providers
+# scratch-write under /tmp or /mnt/data); SANDBOX_RESCUE_ROOTS overrides the
+# list so tests never glob the host's real temp directory.
 PDF_RESCUE_CODE = """import os
 from pathlib import Path
 workspace = Path(os.environ.get("SANDBOX_WORKSPACE", "/workspace")).resolve()
+roots_override = os.environ.get("SANDBOX_RESCUE_ROOTS")
+if roots_override:
+    source_roots = [Path(part) for part in roots_override.split(os.pathsep) if part]
+else:
+    source_roots = [Path.cwd(), Path("/app"), Path("/mnt/data"), Path("/tmp")]
 candidates = []
-for source_root in (Path.cwd(), Path("/app"), Path("/mnt/data"), Path("/tmp")):
+for source_root in source_roots:
     try:
         candidates.extend(source_root.glob("*.pdf"))
     except OSError:
@@ -182,6 +190,21 @@ row counts, and the relevant dataset or columns in your response. Separate
 computed facts from reasonable interpretation. If the request asks for an
 executive summary, first inspect or calculate from the data, then summarize
 the actual findings for an executive audience.
+
+The sandbox ships a report toolkit: import reportkit (it is already on the
+import path, no installation needed). Prefer it over hand-writing reportlab,
+weasyprint, or CSS boilerplate. For PDFs use reportkit.PdfReport(title,
+subtitle, theme="light", accent="#2f6fed"): title_page, kpi_row, section,
+prose, bullets, table, callout, chart, figure, page_break, then
+build(Path(WORKSPACE) / "name.pdf"). For single-file HTML pages use
+reportkit.HtmlPage(title, ...): hero, kpi_row, section, prose, bullets,
+table, callout, chart, figure, raw, then save(Path(WORKSPACE) / "name.html").
+You still decide the structure, order, length, topics, copy, colors, and
+which charts and tables to include; an appendix is just more sections. The
+toolkit only handles rendering. chart() covers quick bar/line/scatter/hist
+plots straight from the data; figure(fig) embeds any custom matplotlib
+figure for full chart control. Raw reportlab and raw(html) blocks remain
+available for layouts the toolkit cannot express.
 
 For dashboard or web-app requests, the task is not complete until a runnable
 app is started inside the sandbox with start_webapp and a renderable artifact
@@ -593,8 +616,9 @@ class OpenAIProvider:
             "model": self.model,
             "input": input_items,
             "stream": True,
-            # Always run reasoning models at maximum effort.
-            "reasoning": {"effort": "max"},
+            # xhigh keeps near-maximum quality on long authoring turns without
+            # the latency tax that maximum effort adds to every round.
+            "reasoning": {"effort": "xhigh"},
         }
         if system:
             request["instructions"] = system
@@ -1031,6 +1055,12 @@ class Agent:
                 ):
                     request_messages[-1]["content"] += "\n\n" + WRAP_UP_NUDGE
                     self.dispatcher.record({"type": "wrap_up_nudge", "step": step + 1})
+                    # Surfaced to the chat status line as well as the
+                    # trajectory, so the wind-down is visible while it happens.
+                    yield {"type": "wrap_up_nudge", "step": step + 1}
+                # Drives the chat status line ("round 9 of 16 · …") during
+                # long turns; the inspector already shows the tool trail.
+                yield {"type": "turn_step", "step": step + 1, "max_steps": MAX_TURN_STEPS}
                 text_parts: list[str] = []
                 tool_calls: list[tuple[str, str, dict[str, Any], dict[str, Any]]] = []
                 async for item in self.provider.stream(request_messages, TOOL_DEFINITIONS):
@@ -1236,11 +1266,11 @@ class Agent:
                         f"artifact on the canvas: {recovery_error}."
                     )
                     final_text = f"{final_text}\n\n{notice}" if final_text else notice
-            if final_text:
-                self.messages.append({"role": "assistant", "content": final_text})
-                yield {"type": "assistant_message", "content": final_text}
-            else:
-                yield {"type": "assistant_message", "content": "The requested sandbox work finished."}
+            if not final_text:
+                final_text = "The requested sandbox work finished."
+            self.messages.append({"role": "assistant", "content": final_text})
+            self.dispatcher.record({"type": "assistant_message", "content": final_text})
+            yield {"type": "assistant_message", "content": final_text}
             yield {"type": "done"}
         except Exception as exc:
             yield {"type": "error", "message": str(exc)}

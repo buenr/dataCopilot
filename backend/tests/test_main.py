@@ -220,8 +220,14 @@ def test_chat_socket_survives_malformed_json(tmp_path: Path):
             assert socket.receive_json() == {"type": "error", "message": "malformed JSON message"}
             # The socket (and its session) survives the bad frame.
             socket.send_json({"type": "user_message", "content": "hello"})
-            types = [socket.receive_json()["type"] for _ in range(4)]
-            assert types == ["user_message", "assistant_delta", "assistant_message", "done"]
+            types = [socket.receive_json()["type"] for _ in range(5)]
+            assert types == [
+                "user_message",
+                "turn_step",
+                "assistant_delta",
+                "assistant_message",
+                "done",
+            ]
 
 
 def test_cancel_with_no_active_turn_sends_cancelled_and_done(tmp_path: Path):
@@ -245,8 +251,14 @@ def test_cancel_with_no_active_turn_sends_cancelled_and_done(tmp_path: Path):
             assert events[1]["type"] == "done"
             # The session remains usable after the cancel.
             socket.send_json({"type": "user_message", "content": "hello"})
-            types = [socket.receive_json()["type"] for _ in range(4)]
-            assert types == ["user_message", "assistant_delta", "assistant_message", "done"]
+            types = [socket.receive_json()["type"] for _ in range(5)]
+            assert types == [
+                "user_message",
+                "turn_step",
+                "assistant_delta",
+                "assistant_message",
+                "done",
+            ]
 
 
 def test_session_resume_replays_transcript(tmp_path: Path):
