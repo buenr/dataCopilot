@@ -6,6 +6,9 @@ executes Python against them, and receive interactive dashboards and PDF
 reports as downloadable artifacts, all inside isolated per-session Docker
 sandboxes.
 
+![Data Copilot workbench: the dataset explorer and analysis chat beside the
+interactive attrition dashboard the agent generated](docs/images/example-dashboard.png)
+
 ## Features
 
 - **Dataset upload and profiling** with automatic schema, statistics, and
@@ -133,12 +136,23 @@ Equivalent `make` targets are available: `make install`, `make backend`,
 
 ## Demo
 
+The screenshots in this README come from a single prompt against the sample
+HR attrition dataset:
+
 1. Upload `sample_data/WA_Fn-UseC_-HR-Employee-Attrition.csv` from the left
    explorer.
-2. Ask **Build a dashboard**.
-3. Ask **Create a PDF whitepaper report**.
-4. Inspect the generated results through the canvas tabs and the execution
-   inspector.
+2. Ask: **"Analyze the dataset, build an interactive web dashboard of the key
+   attrition drivers, and write a polished PDF report."**
+3. The agent profiles the data, runs Python in the session sandbox, and
+   publishes both artifacts to the canvas: `dashboard.html`, a live web app
+   proxied from the container (the hero image above), and `report.pdf`, a
+   six-page decision brief rendered in the document tab:
+
+![The generated PDF report open in the canvas document tab](docs/images/example-report.png)
+
+4. Reopen or download any artifact from the canvas selector; a browser
+   refresh restores the chat, datasets, and artifacts from the session
+   trajectory.
 
 The live smoke test covers the same flow against the real Docker backend:
 
