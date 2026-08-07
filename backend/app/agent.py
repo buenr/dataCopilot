@@ -183,6 +183,21 @@ computed facts from reasonable interpretation. If the request asks for an
 executive summary, first inspect or calculate from the data, then summarize
 the actual findings for an executive audience.
 
+The sandbox ships a report toolkit: import reportkit (it is already on the
+import path, no installation needed). Prefer it over hand-writing reportlab,
+weasyprint, or CSS boilerplate. For PDFs use reportkit.PdfReport(title,
+subtitle, theme="light", accent="#2f6fed"): title_page, kpi_row, section,
+prose, bullets, table, callout, chart, figure, page_break, then
+build(Path(WORKSPACE) / "name.pdf"). For single-file HTML pages use
+reportkit.HtmlPage(title, ...): hero, kpi_row, section, prose, bullets,
+table, callout, chart, figure, raw, then save(Path(WORKSPACE) / "name.html").
+You still decide the structure, order, length, topics, copy, colors, and
+which charts and tables to include; an appendix is just more sections. The
+toolkit only handles rendering. chart() covers quick bar/line/scatter/hist
+plots straight from the data; figure(fig) embeds any custom matplotlib
+figure for full chart control. Raw reportlab and raw(html) blocks remain
+available for layouts the toolkit cannot express.
+
 For dashboard or web-app requests, the task is not complete until a runnable
 app is started inside the sandbox with start_webapp and a renderable artifact
 is registered with register_artifact. Use port 8501 unless there is a good
@@ -593,8 +608,9 @@ class OpenAIProvider:
             "model": self.model,
             "input": input_items,
             "stream": True,
-            # Always run reasoning models at maximum effort.
-            "reasoning": {"effort": "max"},
+            # xhigh keeps near-maximum quality on long authoring turns without
+            # the latency tax that maximum effort adds to every round.
+            "reasoning": {"effort": "xhigh"},
         }
         if system:
             request["instructions"] = system

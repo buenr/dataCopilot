@@ -49,6 +49,8 @@ build-backend = "hatchling.build"
 [dependency-groups]
 dev = [
     "bandit>=1.9.4",
+    "matplotlib>=3.11.1",
+    "reportlab>=5.0.0",
     "ruff>=0.16.2",
     "semgrep>=1.172.0",
     "ty>=0.0.69",

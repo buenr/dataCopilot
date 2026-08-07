@@ -832,13 +832,13 @@ def _install_fake_openai(monkeypatch) -> _FakeResponsesAPI:
 
 
 @pytest.mark.asyncio
-async def test_openai_provider_always_uses_max_reasoning_effort(monkeypatch):
+async def test_openai_provider_uses_xhigh_reasoning_effort(monkeypatch):
     fake = _install_fake_openai(monkeypatch)
     provider = OpenAIProvider("key", "gpt-5.6-luna")
 
     _ = [item async for item in provider.stream([{"role": "user", "content": "hi"}], [])]
 
-    assert fake.requests[0]["reasoning"] == {"effort": "max"}
+    assert fake.requests[0]["reasoning"] == {"effort": "xhigh"}
 
 
 class _BothArtifactsProvider:

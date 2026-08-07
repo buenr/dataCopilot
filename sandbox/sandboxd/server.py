@@ -22,6 +22,22 @@ WORKSPACE = Path(os.environ.get("SANDBOX_WORKSPACE", "/workspace")).resolve()
 WORKSPACE.mkdir(parents=True, exist_ok=True)
 
 
+def seed_reportkit(workspace: Path | None = None) -> Path:
+    """Copy the report toolkit into the workspace so agent code can import it.
+
+    The kernel starts with cwd=WORKSPACE, so a reportkit.py sitting there is
+    importable as plain ``import reportkit``. The module ships inside the
+    sandboxd package (``/app/sandboxd`` in the image), which keeps a single
+    source of truth for both the Docker image and local runs.
+    """
+    source = Path(__file__).with_name("reportkit.py")
+    target_dir = workspace or WORKSPACE
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / "reportkit.py"
+    target.write_bytes(source.read_bytes())
+    return target
+
+
 def safe_workspace_path(name: str, *, allow_missing: bool = True) -> Path:
     if not name or "\x00" in name or Path(name).is_absolute():
         raise ValueError("invalid workspace path")
@@ -43,6 +59,7 @@ class Kernel:
         self.fallback_globals: dict[str, Any] = {"WORKSPACE": WORKSPACE}
 
     def start(self) -> None:
+        seed_reportkit()
         try:
             from jupyter_client import KernelManager
         except ImportError:
