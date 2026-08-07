@@ -4,7 +4,11 @@
     "skipLibCheck": true,
     "module": "ESNext",
     "moduleResolution": "Bundler",
-    "allowSyntheticDefaultImports": true
+    "allowSyntheticDefaultImports": true,
+    // composite projects must emit; redirect the output so tsc -b never
+    // drops a compiled vite.config.js next to the sources, where Vite's
+    // config resolution (.js before .ts) would shadow vite.config.ts.
+    "outDir": "./node_modules/.cache/tsconfig.node"
   },
   "include": ["vite.config.ts"]
 }

@@ -291,14 +291,26 @@ class MockProvider:
 
 
 def dashboard_code() -> str:
+    # The canvas quality gate only publishes dashboards whose visible text
+    # carries concrete dataset values, so the mock computes real metrics from
+    # df_1 the way a competent model would.
     return """from pathlib import Path
 workspace = Path(WORKSPACE)
-html = '''<!doctype html><html><head><meta charset="utf-8"><title>Data Copilot Dashboard</title>
-<style>body{font-family:system-ui;margin:2rem;background:#f8fafc}main{max-width:900px;margin:auto}
-.card{background:white;border:1px solid #e2e8f0;border-radius:12px;padding:1.5rem;box-shadow:0 2px 8px #0001}
-h1{color:#0f172a}.metric{font-size:2rem;font-weight:700;color:#2563eb}</style></head>
+frame = globals().get("df_1")
+rows = len(frame) if frame is not None else 0
+cards = ""
+if frame is not None:
+    for name in frame.select_dtypes(include="number").columns[:4]:
+        value = frame[name].mean()
+        if value == value:  # skip NaN averages
+            cards += f'<p class="metric">{name}: {value:,.2f}</p>'
+html = f'''<!doctype html><html><head><meta charset="utf-8"><title>Data Copilot Dashboard</title>
+<style>body{{font-family:system-ui;margin:2rem;background:#f8fafc}}main{{max-width:900px;margin:auto}}
+.card{{background:white;border:1px solid #e2e8f0;border-radius:12px;padding:1.5rem;box-shadow:0 2px 8px #0001}}
+h1{{color:#0f172a}}.metric{{font-size:2rem;font-weight:700;color:#2563eb}}</style></head>
 <body><main><div class="card"><h1>Data Copilot Dashboard</h1>
-<p class="metric">Analysis complete</p><p>Interactive dashboard generated in the session sandbox.</p>
+<p class="metric">{rows:,} rows analyzed</p>{cards}
+<p>Interactive dashboard generated in the session sandbox.</p>
 </div></main></body></html>'''
 (workspace / "dashboard.html").write_text(html, encoding="utf-8")
 (workspace / "index.html").write_text(html, encoding="utf-8")

@@ -132,7 +132,7 @@ deterministic and requires no API key. Set `LLM_PROVIDER=anthropic` or
 `openai` and provide the corresponding key to use a live provider.
 
 Equivalent `make` targets are available: `make install`, `make backend`,
-`make frontend`, `make build-sandbox`, `make smoke`.
+`make frontend`, `make build-sandbox`, `make smoke`, `make e2e`.
 
 ## Demo
 
@@ -158,6 +158,18 @@ The live smoke test covers the same flow against the real Docker backend:
 
 ```bash
 uv run python scripts/smoke.py
+```
+
+A Playwright suite verifies what a user actually experiences in the browser:
+dataset upload, the agent turn, the live dashboard and PDF in the canvas, and
+a browser refresh restoring the conversation and artifacts. It boots its own
+mock-provider backend and Vite server on ports 8100/5174, so it can run
+alongside a dev session, but it still executes every turn in a real Docker
+sandbox (requires the sandbox image and
+`npx playwright install chromium` once):
+
+```bash
+make e2e
 ```
 
 ## Configuration

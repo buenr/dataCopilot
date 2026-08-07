@@ -1,4 +1,4 @@
-.PHONY: install backend frontend test build-sandbox smoke
+.PHONY: install backend frontend test build-sandbox smoke e2e
 
 install:
 	uv sync
@@ -19,3 +19,8 @@ build-sandbox:
 
 smoke:
 	uv run python scripts/smoke.py
+
+# Playwright end-to-end: drives the real UI against a mock-provider backend
+# with real Docker sandboxes. Starts its own servers on ports 8100/5174.
+e2e:
+	cd frontend && npm run test:e2e
