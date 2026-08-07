@@ -674,11 +674,14 @@ class Agent:
     @staticmethod
     def _is_report_request(content: str) -> bool:
         lowered = content.lower()
-        if "pdf" in lowered or lowered.strip() in {"report", "whitepaper"}:
+        # "whitepaper" and "pdf" are strong signals on their own; "report" needs
+        # an action verb nearby to avoid matching e.g. "what does the report say".
+        if "pdf" in lowered or "whitepaper" in lowered:
+            return True
+        if lowered.strip() == "report":
             return True
         return re.search(
-            r"\b(?:create|generate|write|build|make|produce|export|draft)\b.{0,30}"
-            r"\b(?:report|whitepaper)\b",
+            r"\b(?:create|generate|write|build|make|produce|export|draft)\b.{0,60}\breport\b",
             lowered,
         ) is not None
 

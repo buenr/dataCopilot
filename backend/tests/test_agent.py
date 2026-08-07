@@ -658,3 +658,15 @@ async def test_streaming_events_emit_code_then_deltas_then_complete_without_stdo
     assert any(v["name"] == "answer" for v in complete["variables"])
     assert "stdout" not in complete
     assert "stderr" not in complete
+
+
+def test_report_request_detects_whitepaper_with_long_parenthetical():
+    """Regression: a 31-char gap between verb and 'whitepaper' was not detected."""
+    assert Agent._is_report_request(
+        "create a (insightful but funny tone) whitepaper with analysis of how each player did"
+    )
+    assert Agent._is_report_request("create a whitepaper")
+    assert Agent._is_report_request("write a PDF report")
+    assert Agent._is_report_request("generate a report")
+    assert not Agent._is_report_request("build a dashboard")
+    assert not Agent._is_report_request("what does the report say")

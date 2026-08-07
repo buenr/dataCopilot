@@ -152,7 +152,11 @@ export const useWorkbench = create<WorkbenchState>((set) => ({
   startTool: (tool) => set((state) => ({ tools: [...state.tools, tool] })),
   finishTool: (id, status = 'complete', detail) =>
     set((state) => ({
-      tools: state.tools.map((tool) => (tool.id === id ? { ...tool, status, detail } : tool)),
+      tools: state.tools.map((tool) =>
+        tool.id === id
+          ? { ...tool, status, ...(detail !== undefined ? { detail } : {}) }
+          : tool,
+      ),
     })),
   clearTools: () => set({ tools: [] }),
   updateExecution: (patch) => set((state) => ({ execution: { ...state.execution, ...patch } })),

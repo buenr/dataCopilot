@@ -107,6 +107,50 @@ function profileToDataset(summary: Record<string, unknown>, file?: File): Datase
 
 type ExecutionStateVariable = { name: string; type: string; value?: string };
 
+const TOOL_LABELS: Record<string, string> = {
+  run_python: 'Python',
+  write_file: 'Write file',
+  read_file: 'Read file',
+  list_files: 'List files',
+  start_webapp: 'Start app',
+  stop_webapp: 'Stop app',
+  register_artifact: 'Publish',
+};
+
+function toolLabel(name: string): string {
+  return TOOL_LABELS[name] ?? name;
+}
+
+/** Extract a human-readable one-liner from the tool's input arguments. */
+function toolDetail(name: string, input: unknown): string {
+  if (!input || typeof input !== 'object') return '';
+  const args = input as Record<string, unknown>;
+  switch (name) {
+    case 'run_python': {
+      const code = textValue(args.code);
+      // Show the first meaningful line (skip imports, comments, blanks).
+      const first = code
+        .split('\n')
+        .map((l) => l.trim())
+        .filter((l) => l && !l.startsWith('#') && !l.startsWith('import ') && !l.startsWith('from '))
+        .at(0) ?? '';
+      return first.length > 72 ? first.slice(0, 72) + '…' : first;
+    }
+    case 'write_file':
+    case 'read_file':
+      return textValue(args.path);
+    case 'list_files':
+      return textValue(args.path, '.');
+    case 'start_webapp':
+    case 'stop_webapp':
+      return `port ${args.port ?? '?'}`;
+    case 'register_artifact':
+      return textValue(args.name);
+    default:
+      return '';
+  }
+}
+
 export default function App() {
   const {
     sessionId,
@@ -196,11 +240,12 @@ export default function App() {
         break;
       case 'tool_start': {
         const id = textValue(payload.id, newId('tool'));
+        const rawName = textValue(payload.name ?? payload.tool, 'run_python');
         wb.startTool({
           id,
-          name: textValue(payload.name ?? payload.tool, 'Working'),
+          name: toolLabel(rawName),
           status: 'running',
-          detail: textValue(payload.input),
+          detail: toolDetail(rawName, payload.input),
           startedAt: Date.now(),
         });
         wb.setThinking(false);
@@ -213,7 +258,7 @@ export default function App() {
           wb.finishTool(
             id,
             payload.error ? 'error' : 'complete',
-            textValue(payload.stdout ?? payload.output ?? payload.detail ?? payload.error),
+            payload.error ? textValue(payload.error) : undefined,
           );
         break;
       }
@@ -851,11 +896,7 @@ function Chat({
           </>
         )}
         {tools.length > 0 && (
-          <div className="tool-list">
-            {tools.slice(-4).map((tool) => (
-              <ToolCard key={tool.id} tool={tool} />
-            ))}
-          </div>
+          <ToolList tools={tools} />
         )}
         <div ref={endRef} />
       </div>
@@ -965,9 +1006,43 @@ function Message({ message }: { message: WorkbenchState['messages'][number] }) {
   );
 }
 
-function ToolCard({ tool }: { tool: WorkbenchState['tools'][number] }) {
+function ToolList({ tools }: { tools: WorkbenchState['tools'] }) {
+  const [expanded, setExpanded] = useState(false);
+  // Show running tools always; collapse older completed ones behind a toggle.
+  const running = tools.filter((t) => t.status === 'running');
+  const finished = tools.filter((t) => t.status !== 'running');
+  const visibleFinished = expanded ? finished : finished.slice(-2);
+  const hiddenCount = finished.length - visibleFinished.length;
+  const visible = [...running, ...visibleFinished];
+
   return (
-    <div className="tool-card">
+    <div className="tool-list">
+      {visible.map((tool) => (
+        <ToolCard key={tool.id} tool={tool} />
+      ))}
+      {hiddenCount > 0 && (
+        <button className="tool-list-toggle" onClick={() => setExpanded(true)}>
+          Show {hiddenCount} earlier step{hiddenCount === 1 ? '' : 's'}
+        </button>
+      )}
+      {expanded && finished.length > 2 && (
+        <button className="tool-list-toggle" onClick={() => setExpanded(false)}>
+          Show fewer
+        </button>
+      )}
+    </div>
+  );
+}
+
+function ToolCard({ tool }: { tool: WorkbenchState['tools'][number] }) {
+  const detail =
+    tool.status === 'running'
+      ? tool.detail || 'Running…'
+      : tool.status === 'error'
+        ? tool.detail || 'Failed'
+        : tool.detail || '';
+  return (
+    <div className={`tool-card ${tool.status}`}>
       <div className={`tool-status ${tool.status}`}>
         {tool.status === 'running' ? (
           <RefreshCw size={13} className="spin" />
@@ -977,11 +1052,10 @@ function ToolCard({ tool }: { tool: WorkbenchState['tools'][number] }) {
           <Check size={13} />
         )}
       </div>
-      <div>
+      <div className="tool-card-body">
         <strong>{tool.name}</strong>
-        <span>{tool.status === 'running' ? 'Running in sandbox…' : tool.detail || 'Completed successfully'}</span>
+        {detail && <span className="tool-card-detail">{detail}</span>}
       </div>
-      <Code2 size={15} className="tool-code-icon" />
     </div>
   );
 }
