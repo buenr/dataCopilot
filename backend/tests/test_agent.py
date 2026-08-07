@@ -117,6 +117,9 @@ async def test_agent_returns_tool_results_to_provider_once(tmp_path: Path):
     assert any(event["type"] == "assistant_message" and "1190.0" in event["content"] for event in events)
     trajectory = (tmp_path / "sessions" / "loop" / "trajectory.jsonl").read_text()
     assert trajectory.count('"type": "tool_start"') == 1
+    # The closing message must land in the audit trail, not only on the wire.
+    assert '"type": "assistant_message"' in trajectory
+    assert "1190.0" in trajectory
 
 
 class SetVariableProvider:

@@ -83,6 +83,16 @@ def test_pdf_report_builds_dark_theme(kit, tmp_path, frame):
     assert out.read_bytes().startswith(b"%PDF-")
 
 
+def test_pdf_title_page_escapes_inputs_but_keeps_separator(kit, tmp_path):
+    doc = kit.PdfReport("T & C")
+    doc.title_page(classification="INTERNAL <draft>")
+    joined = "\n".join(getattr(flowable, "text", "") for flowable in doc.story)
+    assert "T &amp; C" in joined
+    assert "INTERNAL &lt;draft&gt;" in joined
+    assert "&middot;" in joined  # the separator entity must survive escaping
+    assert "&amp;middot;" not in joined
+
+
 def test_pdf_unknown_chart_kind_raises(kit, tmp_path):
     doc = kit.PdfReport("t")
     with pytest.raises(ValueError, match="unknown chart kind"):

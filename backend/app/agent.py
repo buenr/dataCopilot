@@ -1252,11 +1252,11 @@ class Agent:
                         f"artifact on the canvas: {recovery_error}."
                     )
                     final_text = f"{final_text}\n\n{notice}" if final_text else notice
-            if final_text:
-                self.messages.append({"role": "assistant", "content": final_text})
-                yield {"type": "assistant_message", "content": final_text}
-            else:
-                yield {"type": "assistant_message", "content": "The requested sandbox work finished."}
+            if not final_text:
+                final_text = "The requested sandbox work finished."
+            self.messages.append({"role": "assistant", "content": final_text})
+            self.dispatcher.record({"type": "assistant_message", "content": final_text})
+            yield {"type": "assistant_message", "content": final_text}
             yield {"type": "done"}
         except Exception as exc:
             yield {"type": "error", "message": str(exc)}

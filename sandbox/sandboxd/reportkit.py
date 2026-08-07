@@ -306,10 +306,10 @@ class PdfReport:
         if self.subtitle:
             self.story.append(Paragraph(_md_lite(self.subtitle), self.styles["subtitle"]))
         self.story.append(Spacer(1, 0.5 * inch))
-        meta = date or _today()
+        meta = _md_lite(date or _today())
         if classification:
-            meta = f"{classification} &middot; {meta}"
-        self.story.append(Paragraph(_md_lite(meta), self.styles["meta"]))
+            meta = f"{_md_lite(classification)} &middot; {meta}"
+        self.story.append(Paragraph(meta, self.styles["meta"]))
         self.story.append(Paragraph(_md_lite(f"Prepared by {self.author}"), self.styles["meta"]))
         self.page_break()
 
