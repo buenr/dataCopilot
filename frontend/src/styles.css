@@ -98,6 +98,11 @@ h1, h2, p { margin: 0; }
 .mono { font-size: 8px; letter-spacing: .05em; }
 .sidebar-toggle { position: absolute; z-index: 2; left: 235px; top: 50%; width: 20px; height: 41px; display: grid; place-items: center; padding: 0; border: 1px solid var(--line); border-left: 0; border-radius: 0 5px 5px 0; color: #728197; background: #101721; transform: translateY(-50%); cursor: pointer; }
 .chat-panel { min-width: 300px; }
+.panel-minimize { width: 26px; height: 26px; margin-top: 2px; flex-shrink: 0; }
+.panel-strip { display: flex; flex-direction: column; align-items: center; gap: 10px; width: 38px; flex-shrink: 0; padding: 14px 0; border: 0; border-right: 1px solid var(--line); background: var(--panel); color: var(--muted); cursor: pointer; transition: color .16s, background .16s; }
+.panel-strip.right { border-right: 0; border-left: 1px solid var(--line); }
+.panel-strip span { writing-mode: vertical-rl; font: 600 10px 'Space Grotesk', sans-serif; letter-spacing: .14em; text-transform: uppercase; }
+.panel-strip:hover { color: var(--blue-bright); background: var(--panel-raised); }
 .resize-handle { width: 5px; display: flex; justify-content: center; align-items: center; background: #0b0f15; cursor: col-resize; }
 .resize-handle span { width: 2px; height: 37px; border-radius: 2px; background: #263346; transition: background .16s; }
 .resize-handle:hover span { background: var(--blue); }

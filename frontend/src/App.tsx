@@ -24,7 +24,11 @@ import {
   LayoutPanelLeft,
   Maximize2,
   Minimize2,
+  PanelLeftClose,
+  PanelLeftOpen,
   PanelRight,
+  PanelRightClose,
+  PanelRightOpen,
   Paperclip,
   Play,
   Plus,
@@ -201,6 +205,8 @@ export default function App() {
   const [uploading, setUploading] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [dragOver, setDragOver] = useState(false);
+  const [chatMinimized, setChatMinimized] = useState(false);
+  const [canvasMinimized, setCanvasMinimized] = useState(false);
   const [sessionKey, setSessionKey] = useState(0);
 
   const handleEvent = useCallback((event: SessionEvent) => {
@@ -621,44 +627,83 @@ export default function App() {
           </button>
         )}
         <PanelGroup direction="horizontal" className="main-panels">
-          {!canvasFullscreen && (
-            <>
-              <Panel defaultSize={35} minSize={28} maxSize={52} className="chat-panel">
-                <Chat
-                  messages={messages}
-                  tools={tools}
-                  draft={draft}
-                  datasets={datasets}
-                  onDraft={setDraft}
-                  onSend={() => sendMessage()}
-                  onSuggestion={sendMessage}
-                  onUpload={handleUpload}
-                  inspectorOpen={inspectorOpen}
-                  onToggleInspector={() => setInspectorOpen(!inspectorOpen)}
-                  execution={execution}
-                  connected={connection === 'connected'}
-                  thinking={thinking}
-                  turnActive={turnActive}
-                  onStop={stopRun}
-                />
-              </Panel>
-              <PanelResizeHandle className="resize-handle">
-                <span />
-              </PanelResizeHandle>
-            </>
+          {!canvasFullscreen && !chatMinimized && (
+            <Panel
+              defaultSize={canvasMinimized ? 100 : 35}
+              minSize={28}
+              // As the only panel the chat must be allowed to fill the space.
+              maxSize={canvasMinimized ? 100 : 52}
+              className="chat-panel"
+            >
+              <Chat
+                messages={messages}
+                tools={tools}
+                draft={draft}
+                datasets={datasets}
+                onDraft={setDraft}
+                onSend={() => sendMessage()}
+                onSuggestion={sendMessage}
+                onUpload={handleUpload}
+                inspectorOpen={inspectorOpen}
+                onToggleInspector={() => setInspectorOpen(!inspectorOpen)}
+                execution={execution}
+                connected={connection === 'connected'}
+                thinking={thinking}
+                turnActive={turnActive}
+                onStop={stopRun}
+                onMinimize={() => {
+                  setChatMinimized(true);
+                  setCanvasMinimized(false);
+                }}
+              />
+            </Panel>
           )}
-          <Panel defaultSize={65} minSize={35} className="canvas-panel">
-            <Canvas
-              sessionId={sessionId}
-              artifact={artifact}
-              artifacts={artifacts}
-              tab={canvasTab}
-              onTab={setCanvasTab}
-              fullscreen={canvasFullscreen}
-              onFullscreen={() => setCanvasFullscreen(!canvasFullscreen)}
-              onSelectArtifact={selectArtifact}
-            />
-          </Panel>
+          {!canvasFullscreen && chatMinimized && (
+            <button
+              className="panel-strip"
+              onClick={() => setChatMinimized(false)}
+              aria-label="Expand chat panel"
+              title="Show chat"
+            >
+              <PanelLeftOpen size={15} />
+              <span>Chat</span>
+            </button>
+          )}
+          {!canvasFullscreen && !chatMinimized && !canvasMinimized && (
+            <PanelResizeHandle className="resize-handle">
+              <span />
+            </PanelResizeHandle>
+          )}
+          {!canvasMinimized && (
+            <Panel defaultSize={65} minSize={35} className="canvas-panel">
+              <Canvas
+                sessionId={sessionId}
+                artifact={artifact}
+                artifacts={artifacts}
+                tab={canvasTab}
+                onTab={setCanvasTab}
+                fullscreen={canvasFullscreen}
+                onFullscreen={() => setCanvasFullscreen(!canvasFullscreen)}
+                onSelectArtifact={selectArtifact}
+                onMinimize={() => {
+                  setCanvasMinimized(true);
+                  setChatMinimized(false);
+                  setCanvasFullscreen(false);
+                }}
+              />
+            </Panel>
+          )}
+          {canvasMinimized && (
+            <button
+              className="panel-strip right"
+              onClick={() => setCanvasMinimized(false)}
+              aria-label="Expand canvas panel"
+              title="Show canvas"
+            >
+              <span>Canvas</span>
+              <PanelRightOpen size={15} />
+            </button>
+          )}
         </PanelGroup>
       </main>
     </div>
@@ -937,6 +982,7 @@ function Chat({
   thinking,
   turnActive,
   onStop,
+  onMinimize,
   datasets,
 }: {
   messages: WorkbenchState['messages'];
@@ -953,6 +999,7 @@ function Chat({
   thinking: boolean;
   turnActive: boolean;
   onStop: () => void;
+  onMinimize: () => void;
   datasets: Dataset[];
 }) {
   const endRef = useRef<HTMLDivElement>(null);
@@ -976,6 +1023,14 @@ function Chat({
           <span className="eyebrow">Copilot</span>
           <h1>What will we uncover?</h1>
         </div>
+        <button
+          className="icon-button panel-minimize"
+          onClick={onMinimize}
+          aria-label="Minimize chat panel"
+          title="Minimize chat"
+        >
+          <PanelLeftClose size={15} />
+        </button>
       </div>
       <div className="chat-scroll">
         {messages.length === 0 && !thinking ? (
@@ -1243,6 +1298,7 @@ function Canvas({
   fullscreen,
   onFullscreen,
   onSelectArtifact,
+  onMinimize,
 }: {
   sessionId?: string;
   artifact?: WorkbenchState['artifact'];
@@ -1252,6 +1308,7 @@ function Canvas({
   fullscreen: boolean;
   onFullscreen: () => void;
   onSelectArtifact: (name: string) => void;
+  onMinimize: () => void;
 }) {
   const [zoom, setZoom] = useState(100);
   const [refreshKey, setRefreshKey] = useState(0);
@@ -1314,6 +1371,9 @@ function Canvas({
           <span className="toolbar-divider" />
           <button className="icon-button" aria-label="Refresh artifact" onClick={() => setRefreshKey((value) => value + 1)}>
             <RefreshCw size={15} />
+          </button>
+          <button className="icon-button" aria-label="Minimize canvas panel" title="Minimize canvas" onClick={onMinimize}>
+            <PanelRightClose size={15} />
           </button>
           <button className="icon-button" aria-label={fullscreen ? 'Exit full screen' : 'Enter full screen'} onClick={onFullscreen}>
             {fullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
