@@ -41,11 +41,19 @@ WRAP_UP_NUDGE = (
 # The kernel preloads WORKSPACE for convenience, but agent code can reassign it,
 # so this snippet resolves the real workspace from the sandbox environment. A
 # wrong destination would silently copy a rescued PDF back onto itself.
+# Scan roots default to known provider output locations (some providers
+# scratch-write under /tmp or /mnt/data); SANDBOX_RESCUE_ROOTS overrides the
+# list so tests never glob the host's real temp directory.
 PDF_RESCUE_CODE = """import os
 from pathlib import Path
 workspace = Path(os.environ.get("SANDBOX_WORKSPACE", "/workspace")).resolve()
+roots_override = os.environ.get("SANDBOX_RESCUE_ROOTS")
+if roots_override:
+    source_roots = [Path(part) for part in roots_override.split(os.pathsep) if part]
+else:
+    source_roots = [Path.cwd(), Path("/app"), Path("/mnt/data"), Path("/tmp")]
 candidates = []
-for source_root in (Path.cwd(), Path("/app"), Path("/mnt/data"), Path("/tmp")):
+for source_root in source_roots:
     try:
         candidates.extend(source_root.glob("*.pdf"))
     except OSError:

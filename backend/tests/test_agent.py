@@ -1,3 +1,4 @@
+import os
 import sys
 import types
 from pathlib import Path
@@ -497,9 +498,18 @@ async def test_report_request_explains_why_no_pdf_reached_the_canvas(tmp_path: P
     assert "no PDF artifact was found in the sandbox workspace" in message["content"]
 
 
-def run_pdf_rescue(workspace: Path, working_directory: Path, monkeypatch) -> None:
+def run_pdf_rescue(
+    workspace: Path,
+    working_directory: Path,
+    monkeypatch,
+    scan_roots: tuple[Path, ...] = (),
+) -> None:
     monkeypatch.setenv("SANDBOX_WORKSPACE", str(workspace))
     monkeypatch.chdir(working_directory)
+    # Keep the scan hermetic: without this override the snippet would glob the
+    # host's real /tmp and pick up unrelated PDFs from outside the test.
+    roots = scan_roots or (working_directory,)
+    monkeypatch.setenv("SANDBOX_RESCUE_ROOTS", os.pathsep.join(str(root) for root in roots))
     # A clobbered WORKSPACE global is exactly the failure the snippet must survive.
     exec(compile(PDF_RESCUE_CODE, "<rescue>", "exec"), {"WORKSPACE": "/app"})
 
@@ -525,6 +535,21 @@ def test_pdf_rescue_leaves_workspace_files_untouched(tmp_path: Path, monkeypatch
 
     assert not (workspace / "whitepaper.pdf").exists()
     assert sorted(path.name for path in workspace.rglob("*.pdf")) == ["whitepaper.pdf"]
+
+
+def test_pdf_rescue_ignores_pdfs_outside_the_configured_scan_roots(tmp_path: Path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    working_directory = tmp_path / "app"
+    working_directory.mkdir()
+    stray = tmp_path / "stray"
+    stray.mkdir()
+    (stray / "scratch.pdf").write_bytes(b"%PDF-1.4 unrelated")
+
+    run_pdf_rescue(workspace, working_directory, monkeypatch)
+
+    assert not (workspace / "scratch.pdf").exists()
+    assert list(workspace.rglob("*.pdf")) == []
 
 
 def test_anthropic_history_maps_openai_tool_flow_to_content_blocks():
