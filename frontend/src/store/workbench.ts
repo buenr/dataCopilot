@@ -24,6 +24,7 @@ export type WorkbenchState = {
   setConnection: (connection: ConnectionState) => void;
   addMessage: (message: ChatMessage) => void;
   appendAssistantDelta: (delta: string) => void;
+  setAssistantMessage: (content: string) => void;
   finishAssistant: () => void;
   addDataset: (dataset: Dataset) => void;
   setArtifact: (artifact: Artifact) => void;
@@ -71,6 +72,26 @@ export const useWorkbench = create<WorkbenchState>((set) => ({
         messages: [
           ...state.messages,
           { id: `assistant-${Date.now()}`, role: 'assistant', content: delta, timestamp: Date.now(), streaming: true },
+        ],
+      };
+    }),
+  setAssistantMessage: (content) =>
+    set((state) => {
+      const last = state.messages[state.messages.length - 1];
+      if (last?.role === 'assistant' && last.streaming) {
+        // The backend streams deltas and then re-sends the full reply in the
+        // final assistant_message event; replace rather than append so the
+        // reply is not duplicated.
+        return {
+          messages: state.messages.map((message, index) =>
+            index === state.messages.length - 1 ? { ...message, content } : message,
+          ),
+        };
+      }
+      return {
+        messages: [
+          ...state.messages,
+          { id: `assistant-${Date.now()}`, role: 'assistant', content, timestamp: Date.now(), streaming: true },
         ],
       };
     }),

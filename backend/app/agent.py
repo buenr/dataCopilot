@@ -242,7 +242,14 @@ class MockProvider:
     """Deterministic offline provider used by the POC and smoke tests."""
 
     async def stream(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> AsyncIterator[str | dict[str, Any]]:
-        prompt = messages[-1]["content"].lower()
+        last = messages[-1]
+        if last.get("role") == "tool":
+            # Tool results just came back; wrap up instead of pattern-matching
+            # the result payload (which mentions e.g. "dashboard.html") into
+            # another round of identical tool calls until the turn cap.
+            yield "Done. The requested output is ready in the canvas."
+            return
+        prompt = str(last.get("content") or "").lower()
         if "dashboard" in prompt or "web app" in prompt or "webapp" in prompt:
             yield {"tool": "run_python", "arguments": {"code": dashboard_code()}}
             yield {
@@ -311,24 +318,90 @@ class AnthropicProvider:
     def __init__(self, api_key: str, model: str):
         self.api_key, self.model = api_key, model
 
-    async def stream(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> AsyncIterator[str]:
+    async def stream(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> AsyncIterator[str | dict[str, Any]]:
         try:
             from anthropic import AsyncAnthropic
         except ImportError as exc:
             raise RuntimeError("Anthropic provider requires the optional providers dependency") from exc
         client = AsyncAnthropic(api_key=self.api_key)
         system = next((item["content"] for item in messages if item.get("role") == "system"), None)
-        user_messages = [item for item in messages if item.get("role") != "system"]
         request: dict[str, Any] = {
             "model": self.model,
             "max_tokens": 2048,
-            "messages": user_messages,
+            "messages": self._convert_messages(messages),
         }
         if system:
             request["system"] = system
+        if tools:
+            request["tools"] = [
+                {
+                    "name": item["function"]["name"],
+                    "description": item["function"].get("description", ""),
+                    "input_schema": item["function"]["parameters"],
+                }
+                for item in tools
+            ]
         async with client.messages.stream(**request) as stream:
             async for text in stream.text_stream:
                 yield text
+            final = await stream.get_final_message()
+        for block in final.content:
+            if getattr(block, "type", None) == "tool_use":
+                yield {
+                    "tool": getattr(block, "name", ""),
+                    "arguments": block.input if isinstance(block.input, dict) else {},
+                    "call_id": getattr(block, "id", ""),
+                }
+
+    @staticmethod
+    def _convert_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Translate the OpenAI-shaped running history into Anthropic content blocks.
+
+        Assistant tool calls become tool_use blocks; tool results become
+        tool_result blocks inside a user message, with consecutive results
+        merged so the conversation keeps the user/assistant alternation the
+        API expects.
+        """
+        converted: list[dict[str, Any]] = []
+        for message in messages:
+            role = message.get("role")
+            if role == "system":
+                continue
+            if role == "assistant" and message.get("tool_calls"):
+                blocks: list[dict[str, Any]] = []
+                if message.get("content"):
+                    blocks.append({"type": "text", "text": message["content"]})
+                for call in message["tool_calls"]:
+                    function = call["function"]
+                    try:
+                        inputs = json.loads(function.get("arguments") or "{}")
+                    except json.JSONDecodeError:
+                        inputs = {}
+                    blocks.append(
+                        {
+                            "type": "tool_use",
+                            "id": call["id"],
+                            "name": function["name"],
+                            "input": inputs,
+                        }
+                    )
+                converted.append({"role": "assistant", "content": blocks})
+            elif role == "tool":
+                block = {
+                    "type": "tool_result",
+                    "tool_use_id": message["tool_call_id"],
+                    "content": message.get("content", ""),
+                }
+                previous = converted[-1] if converted else None
+                if previous and previous["role"] == "user" and isinstance(previous["content"], list):
+                    previous["content"].append(block)
+                else:
+                    converted.append({"role": "user", "content": [block]})
+            elif role in {"user", "assistant"}:
+                content = message.get("content") or ""
+                if content:
+                    converted.append({"role": role, "content": content})
+        return converted
 
 
 class OpenAIProvider:
@@ -560,10 +633,12 @@ class ToolDispatcher:
     async def _run_with_retries(self, code: str) -> Execution:
         execution = await self.sandbox.exec(code)
         retries = 0
-        while execution.stderr and retries < 3:
+        # Retry only a bare failure (stderr with no stdout and no result), the
+        # signature of a transient kernel error. Code that already produced
+        # output must not be re-executed: stderr also carries harmless warnings,
+        # and re-running would duplicate side effects such as file writes.
+        while execution.stderr and not execution.stdout and execution.result is None and retries < 3:
             retries += 1
-            # A provider would receive this context; retrying the same deterministic
-            # code is useful for transient fake-kernel errors without hiding stderr.
             execution = await self.sandbox.exec(code)
         return execution
 

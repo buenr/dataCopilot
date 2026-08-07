@@ -145,3 +145,80 @@ async def test_preflight_allows_both_loopback_spellings_of_the_dev_origin(tmp_pa
 def test_production_cors_origins_are_not_expanded():
     settings = Settings(app_env="production", frontend_origin="http://localhost:5173")
     assert cors_origins(settings) == ["http://localhost:5173"]
+
+
+@pytest.mark.asyncio
+async def test_preview_rejects_unregistered_port(tmp_path: Path):
+    settings = Settings(sessions_dir=str(tmp_path / "sessions"))
+    manager = SessionManager(
+        settings,
+        sandbox_factory=lambda sid: FakeSandbox(sid, tmp_path / "workspaces" / sid),
+    )
+    application = create_app(settings, manager)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application),
+        base_url="http://test",
+    ) as client:
+        created = await client.post("/api/sessions")
+        session_id = created.json()["id"]
+        # No webapp registered this port; the gateway must refuse to dial an
+        # arbitrary loopback port on the client's behalf (SSRF guard).
+        response = await client.get(f"/api/sessions/{session_id}/preview/8000/")
+
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_upload_numbers_dataframes_consistently_with_profiles(tmp_path: Path):
+    settings = Settings(sessions_dir=str(tmp_path / "sessions"))
+    manager = SessionManager(
+        settings,
+        sandbox_factory=lambda sid: FakeSandbox(sid, tmp_path / "workspaces" / sid),
+    )
+    application = create_app(settings, manager)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application),
+        base_url="http://test",
+    ) as client:
+        created = await client.post("/api/sessions")
+        session_id = created.json()["id"]
+        # An unsupported file that sorts first must not shift the df_N numbering
+        # away from the profiles the agent is shown.
+        response = await client.post(
+            f"/api/sessions/{session_id}/files",
+            files=[
+                ("files", ("aaa-notes.txt", b"not a dataset", "text/plain")),
+                ("files", ("sales.csv", b"region,revenue\nNorth,1200\n", "text/csv")),
+            ],
+        )
+
+    assert response.status_code == 200
+    assert [(s["name"], s["file"]) for s in response.json()["schemas"]] == [("df_1", "sales.csv")]
+    session = manager.get(session_id)
+    execution = await session.sandbox.exec("print(df_1['region'].iloc[0])")
+    assert execution.stdout.strip() == "North"
+
+
+def test_chat_socket_survives_malformed_json(tmp_path: Path):
+    from fastapi.testclient import TestClient
+
+    # Pin the mock provider so a developer .env cannot route this test to a real LLM.
+    settings = Settings(sessions_dir=str(tmp_path / "sessions"), llm_provider="mock")
+    manager = SessionManager(
+        settings,
+        sandbox_factory=lambda sid: FakeSandbox(sid, tmp_path / "workspaces" / sid),
+    )
+    application = create_app(settings, manager)
+
+    with TestClient(application) as client:
+        session_id = client.post("/api/sessions").json()["id"]
+        with client.websocket_connect(f"/ws/sessions/{session_id}") as socket:
+            assert socket.receive_json()["type"] == "session_ready"
+            socket.send_text("this is not json")
+            assert socket.receive_json() == {"type": "error", "message": "malformed JSON message"}
+            # The socket (and its session) survives the bad frame.
+            socket.send_json({"type": "user_message", "content": "hello"})
+            types = [socket.receive_json()["type"] for _ in range(4)]
+            assert types == ["user_message", "assistant_delta", "assistant_message", "done"]
