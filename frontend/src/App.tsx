@@ -619,7 +619,7 @@ export default function App() {
         )}
         {!canvasFullscreen && (
           <button
-            className="sidebar-toggle"
+            className={sidebarOpen ? 'sidebar-toggle' : 'sidebar-toggle closed'}
             onClick={() => setSidebarOpen(!sidebarOpen)}
             aria-label={sidebarOpen ? 'Hide data explorer' : 'Show data explorer'}
           >
