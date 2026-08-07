@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
-  Activity,
   AlertCircle,
   ArrowUp,
   BarChart3,
@@ -9,22 +8,18 @@ import {
   ChevronRight,
   CircleHelp,
   Code2,
-  Columns3,
   Database,
   Download,
   ExternalLink,
   FileBarChart,
-  FileCode2,
   FileJson,
   FileSpreadsheet,
   FileText,
-  FolderOpen,
   Gauge,
   Globe2,
   HardDriveUpload,
   LayoutPanelLeft,
   Maximize2,
-  MessageSquare,
   Minimize2,
   MoreHorizontal,
   PanelRight,
@@ -38,7 +33,6 @@ import {
   Sparkles,
   Table2,
   Terminal,
-  Upload,
   X,
   ZoomIn,
   ZoomOut,
@@ -194,16 +188,24 @@ export default function App() {
         setSessionId(id);
         const socket = new WebSocket(websocketUrl(`/ws/sessions/${id}`));
         socketRef.current = socket;
-        socket.onopen = () => setConnection('connected');
+        const isCurrentSocket = () => socketRef.current === socket && !disposed;
+        socket.onopen = () => {
+          if (isCurrentSocket()) setConnection('connected');
+        };
         socket.onmessage = (message) => {
+          if (!isCurrentSocket()) return;
           try {
             handleEvent(JSON.parse(message.data) as SessionEvent);
           } catch {
             addMessage({ id: newId('error'), role: 'system', content: 'Received an unreadable event from the gateway.', timestamp: Date.now() });
           }
         };
-        socket.onerror = () => setConnection('error');
-        socket.onclose = () => setConnection('offline');
+        socket.onerror = () => {
+          if (isCurrentSocket()) setConnection('error');
+        };
+        socket.onclose = () => {
+          if (isCurrentSocket()) setConnection('offline');
+        };
       } catch (error) {
         if (!disposed) {
           setConnection('offline');
@@ -449,7 +451,15 @@ function Canvas({ sessionId, artifact, tab, onTab, fullscreen, onFullscreen }: {
   const [refreshKey, setRefreshKey] = useState(0);
   const previewUrl = useMemo(() => {
     if (!sessionId || !artifact?.port) return '';
-    return apiUrl(`/api/sessions/${sessionId}/preview/${artifact.port}/`);
+    // Static servers need the generated HTML filename. Some sandbox handoffs
+    // provide the filename as `name` but omit `path`, which otherwise opens
+    // the server root and shows a directory listing.
+    const artifactName = artifact.name || '';
+    const artifactPath = artifact.path || (/\.(html?|xhtml)$/i.test(artifactName) ? artifactName : '');
+    const previewPath = artifactPath
+      ? artifactPath.split('/').map((segment) => encodeURIComponent(segment)).join('/')
+      : '';
+    return apiUrl(`/api/sessions/${sessionId}/preview/${artifact.port}/${previewPath}`);
   }, [sessionId, artifact]);
   const pdfUrl = artifact?.url || (sessionId && artifact?.path ? apiUrl(`/api/sessions/${sessionId}/artifacts/${encodeURIComponent(artifact.path)}`) : '');
   return <section className="canvas">

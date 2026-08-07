@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     app_env: str = "development"
     backend_host: str = "0.0.0.0"
     backend_port: int = 8000
-    frontend_origin: str = "http://localhost:5173"
+    frontend_origin: str = "http://localhost:5173,http://127.0.0.1:5173"
     session_ttl_minutes: int = 30
     session_volume_prefix: str = "dc"
     sandbox_image: str = "data-copilot-sandbox:latest"

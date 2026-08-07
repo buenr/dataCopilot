@@ -6,7 +6,9 @@ import asyncio
 import mimetypes
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import PurePosixPath
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
@@ -24,6 +26,64 @@ from .sandbox import SessionManager
 class Message(BaseModel):
     type: str = "user_message"
     content: str = Field(min_length=1)
+
+
+async def _preview_file_fallback(session: Any, path: str) -> Response | None:
+    """Serve workspace files when a static server points at a wrong directory."""
+    requested = path.strip("/")
+    candidates = [requested] if requested else []
+    if not candidates:
+        try:
+            files = await session.sandbox.list_files(".")
+        except Exception:
+            return None
+        html_files = [
+            str(item.get("path", ""))
+            for item in files
+            if isinstance(item, dict)
+            and not item.get("directory")
+            and str(item.get("path", "")).lower().endswith((".html", ".htm", ".xhtml"))
+        ]
+        candidates = sorted(
+            html_files,
+            key=lambda item: (
+                0 if PurePosixPath(item).name == "dashboard.html" else
+                1 if PurePosixPath(item).name == "index.html" else 2,
+                item,
+            ),
+        )
+
+    for candidate in candidates:
+        if not candidate or candidate.startswith("../") or "/../" in candidate:
+            continue
+        try:
+            content = await session.sandbox.read_file(candidate)
+        except Exception:
+            continue
+        media_type = mimetypes.guess_type(candidate)[0] or "application/octet-stream"
+        return Response(content, media_type=media_type)
+    return None
+
+
+_LOOPBACK_ALIASES = {"localhost": "127.0.0.1", "127.0.0.1": "localhost"}
+
+
+def cors_origins(settings: Settings) -> list[str]:
+    """Resolve the browser origins allowed to call the gateway."""
+    origins = [item.strip() for item in settings.frontend_origin.split(",") if item.strip()]
+    if settings.app_env.lower() == "development":
+        # Browsers treat http://localhost:5173 and http://127.0.0.1:5173 as different
+        # origins, so a single configured dev origin has to cover both spellings.
+        for origin in list(origins):
+            parts = urlsplit(origin)
+            alias = _LOOPBACK_ALIASES.get(parts.hostname or "")
+            if alias is None:
+                continue
+            netloc = alias if parts.port is None else f"{alias}:{parts.port}"
+            candidate = urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+            if candidate not in origins:
+                origins.append(candidate)
+    return origins
 
 
 def make_provider(settings: Settings) -> Any:
@@ -64,7 +124,7 @@ def create_app(settings: Settings | None = None, manager: SessionManager | None 
     application = FastAPI(title="Data Copilot", version="0.1.0", lifespan=lifespan)
     application.state.session_manager = session_manager
     application.state.settings = settings
-    origins = [item.strip() for item in settings.frontend_origin.split(",") if item.strip()]
+    origins = cors_origins(settings)
     application.add_middleware(
         CORSMiddleware,
         allow_origins=origins or ["*"],
@@ -225,6 +285,18 @@ def create_app(settings: Settings | None = None, manager: SessionManager | None 
                 upstream = await client.request(request.method, target, content=body, headers=headers)
             except httpx.HTTPError as exc:
                 raise HTTPException(502, f"preview upstream unavailable: {exc}") from exc
+        upstream_is_directory_listing = (
+            upstream.status_code == 200
+            and not path.strip("/")
+            and "text/html" in upstream.headers.get("content-type", "")
+            and b"Directory listing for" in upstream.content
+        )
+        if request.method == "GET" and (
+            upstream.status_code == 404 or upstream_is_directory_listing
+        ):
+            fallback = await _preview_file_fallback(session, path)
+            if fallback is not None:
+                return fallback
         response_headers = {key: value for key, value in upstream.headers.items() if key.lower() not in {"content-length", "transfer-encoding", "connection"}}
         return Response(upstream.content, status_code=upstream.status_code, headers=response_headers, media_type=upstream.headers.get("content-type"))
 

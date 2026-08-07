@@ -47,9 +47,13 @@ class Kernel:
         try:
             from jupyter_client import KernelManager
         except ImportError:
+            os.chdir(WORKSPACE)
             return
         self.manager = KernelManager()
-        self.manager.start_kernel()
+        # Agent code routinely writes to the current directory. Only the mounted
+        # workspace is persisted and downloadable, so the kernel must start there
+        # rather than in the image's build directory.
+        self.manager.start_kernel(cwd=str(WORKSPACE))
         self.client = self.manager.client()
         self.client.start_channels()
         self.client.wait_for_ready(timeout=30)

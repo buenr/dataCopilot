@@ -2,16 +2,47 @@
 
 from __future__ import annotations
 
+import html
 import json
+import re
+import shlex
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Protocol
 
-from .paths import safe_path
 from .sandbox import Execution, Sandbox
 
 TOOLS = {"run_python", "write_file", "read_file", "list_files", "start_webapp", "stop_webapp", "register_artifact"}
+PROVIDER_WORKSPACE = "/home/oai/share"
+# The kernel preloads WORKSPACE for convenience, but agent code can reassign it,
+# so this snippet resolves the real workspace from the sandbox environment. A
+# wrong destination would silently copy a rescued PDF back onto itself.
+PDF_RESCUE_CODE = """import os
+from pathlib import Path
+workspace = Path(os.environ.get("SANDBOX_WORKSPACE", "/workspace")).resolve()
+candidates = []
+for source_root in (Path.cwd(), Path("/app"), Path("/mnt/data"), Path("/tmp")):
+    try:
+        candidates.extend(source_root.glob("*.pdf"))
+    except OSError:
+        pass
+valid = []
+for source in candidates:
+    try:
+        source = source.resolve()
+        if source.is_relative_to(workspace):
+            continue
+        data = source.read_bytes()
+        if data.startswith(b"%PDF-"):
+            valid.append((source.stat().st_mtime, source, data))
+    except OSError:
+        pass
+if valid:
+    _, source, data = max(valid, key=lambda item: item[0])
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / source.name).write_bytes(data)
+"""
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "type": "function",
@@ -127,6 +158,25 @@ row counts, and the relevant dataset or columns in your response. Separate
 computed facts from reasonable interpretation. If the request asks for an
 executive summary, first inspect or calculate from the data, then summarize
 the actual findings for an executive audience.
+
+For dashboard or web-app requests, the task is not complete until a runnable
+app is started inside the sandbox with start_webapp and a renderable artifact
+is registered with register_artifact. Use port 8501 unless there is a good
+reason not to. When data is uploaded, render concrete dataset-derived values
+in the initial page HTML, including at least one KPI and one grouped or
+comparative insight. Do not rely only on a JavaScript data constant, blank
+placeholders, or values that appear only after a client-side failure. Read the
+generated HTML before handoff and verify that the visible page contains real
+values from the uploaded data. Do not claim completion after only writing
+source code.
+
+For PDF or report requests, write the final PDF inside the sandbox workspace
+using Path(WORKSPACE) (for example, Path(WORKSPACE) / "report.pdf"), then call
+register_artifact with the PDF filename and type "pdf". WORKSPACE is already
+defined for you; never reassign it, and never substitute os.getcwd() for it.
+Only files inside the workspace can be previewed or downloaded, so do not save
+the only copy under /mnt/data or /tmp, and do not claim completion without
+registering the PDF artifact.
 """
     if not dataset_profiles:
         return prompt + "\nNo dataset has been uploaded yet."
@@ -137,6 +187,21 @@ the actual findings for an executive audience.
         + "DATASET_PROFILES_JSON:\n"
         + json.dumps(dataset_profiles, default=str)
     )
+
+
+def _http_server_directory(command: str) -> str | None:
+    if "http.server" not in command:
+        return None
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+    for index, token in enumerate(tokens):
+        if token == "--directory" and index + 1 < len(tokens):
+            return tokens[index + 1]
+        if token.startswith("--directory="):
+            return token.split("=", 1)[1]
+    return None
 
 
 def mock_executive_summary(messages: list[dict[str, Any]]) -> str:
@@ -409,6 +474,46 @@ class ToolDispatcher:
         with self.trajectory_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, default=str) + "\n")
 
+    @staticmethod
+    def _normalize_webapp_command(command: str) -> str:
+        """Keep static servers inside the sandbox workspace.
+
+        Providers sometimes use paths from their own runtime, such as
+        ``/home/oai/share``. The sandbox process already starts in its
+        workspace, so those paths make an otherwise valid dashboard return
+        404. Other absolute paths, such as the sandbox's own ``/workspace``,
+        must remain unchanged.
+        """
+        directory = _http_server_directory(command)
+        provider_prefix = f"{PROVIDER_WORKSPACE}/"
+        if directory is None or (
+            directory != PROVIDER_WORKSPACE and not directory.startswith(provider_prefix)
+        ):
+            return command
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            return command
+
+        replacement = directory[len(PROVIDER_WORKSPACE):].lstrip("/")
+        normalized: list[str] = []
+        index = 0
+        while index < len(tokens):
+            token = tokens[index]
+            if token == "--directory" and index + 1 < len(tokens):
+                if replacement:
+                    normalized.extend((token, replacement))
+                index += 2
+                continue
+            if token.startswith("--directory="):
+                if replacement:
+                    normalized.append(f"--directory={replacement}")
+                index += 1
+                continue
+            normalized.append(token)
+            index += 1
+        return shlex.join(normalized)
+
     async def dispatch(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if name not in TOOLS:
             raise ValueError(f"unknown tool: {name}")
@@ -428,14 +533,16 @@ class ToolDispatcher:
             data = await self.sandbox.read_file(str(arguments["path"]))
             result = {"path": arguments["path"], "content": data.decode("utf-8", errors="replace")}
         elif name == "list_files":
-            result = {"files": await self.sandbox.list_files(str(arguments.get("path", ".")))}
+            path = str(arguments.get("path", "."))
+            result = {"files": await self.sandbox.list_files("." if path == "/" else path)}
         elif name == "start_webapp":
             port = int(arguments.get("port", 8501))
-            result = {"port": await self.sandbox.start_webapp(str(arguments["command"]), port)}
+            command = self._normalize_webapp_command(str(arguments["command"]))
+            result = {"port": await self.sandbox.start_webapp(command, port)}
         elif name == "stop_webapp":
             await self.sandbox.stop_webapp(int(arguments["port"]))
             result = {"port": arguments["port"], "stopped": True}
-        else:
+        elif name == "register_artifact":
             artifacts = await self.sandbox.artifacts()
             requested = arguments.get("name")
             selected = [a for a in artifacts if not requested or a.get("name") == requested]
@@ -445,6 +552,8 @@ class ToolDispatcher:
                 if arguments.get("type"):
                     artifact["type"] = arguments["type"]
             result = {"artifacts": selected}
+        else:
+            raise ValueError(f"unhandled tool: {name}")
         self.record({"type": "tool_result", "tool": name, "result": result})
         return result
 
@@ -473,15 +582,402 @@ class Agent:
         self.dataset_context = dataset_context or (lambda: [])
         self.messages: list[dict[str, Any]] = []
 
+    @staticmethod
+    def _is_dashboard_request(content: str) -> bool:
+        lowered = content.lower()
+        return "dashboard" in lowered or "web app" in lowered or "webapp" in lowered
+
+    @staticmethod
+    def _is_report_request(content: str) -> bool:
+        lowered = content.lower()
+        if "pdf" in lowered or lowered.strip() in {"report", "whitepaper"}:
+            return True
+        return re.search(
+            r"\b(?:create|generate|write|build|make|produce|export|draft)\b.{0,30}"
+            r"\b(?:report|whitepaper)\b",
+            lowered,
+        ) is not None
+
+    @staticmethod
+    def _is_pdf_artifact(artifact: dict[str, Any]) -> bool:
+        path = str(artifact.get("path") or artifact.get("name") or "").lower()
+        return artifact.get("type") == "pdf" or path.endswith(".pdf")
+
+    async def _recover_pdf_artifact(self) -> tuple[dict[str, Any] | None, str | None]:
+        """Recover a PDF when a provider wrote it but omitted the handoff."""
+        async def find_pdf() -> str | None:
+            listing = await self.dispatcher.dispatch("list_files", {"path": "."})
+            files = listing.get("files", [])
+            for item in files:
+                if (
+                    not isinstance(item, dict)
+                    or item.get("directory")
+                    or int(item.get("size", 0) or 0) < 5
+                    or not str(item.get("path", "")).lower().endswith(".pdf")
+                ):
+                    continue
+                try:
+                    result = await self.dispatcher.dispatch(
+                        "read_file",
+                        {"path": str(item["path"])},
+                    )
+                    if str(result.get("content", "")).startswith("%PDF-"):
+                        return str(item["path"])
+                except Exception:
+                    continue
+            return None
+
+        try:
+            pdf_path = await find_pdf()
+            # Providers occasionally write their output to the working directory,
+            # /mnt/data, or /tmp. Copy only those known runtime output locations,
+            # never arbitrary host paths, into the persisted workspace.
+            if not pdf_path and not hasattr(self.dispatcher.sandbox, "root"):
+                await self.dispatcher.dispatch("run_python", {"code": PDF_RESCUE_CODE})
+                pdf_path = await find_pdf()
+            if not pdf_path:
+                return None, "no PDF artifact was found in the sandbox workspace"
+            artifact_result = await self.dispatcher.dispatch(
+                "register_artifact",
+                {"name": Path(pdf_path).name, "type": "pdf"},
+            )
+            artifact = next(
+                (
+                    item
+                    for item in artifact_result.get("artifacts", [])
+                    if self._is_pdf_artifact(item)
+                ),
+                None,
+            )
+            if not artifact:
+                return None, "the recovered PDF could not be registered"
+            artifact["type"] = "pdf"
+            return artifact, None
+        except Exception as exc:
+            return None, str(exc)
+
+    async def _recover_dashboard_artifact(
+        self,
+        started_ports: dict[int, str],
+        dataset_profiles: list[dict[str, Any]] | None = None,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Finish the canvas handoff when a provider stopped after writing code."""
+        try:
+            listing = await self.dispatcher.dispatch("list_files", {"path": "."})
+            files = listing.get("files", [])
+            paths = [
+                str(item.get("path", ""))
+                for item in files
+                if isinstance(item, dict) and not item.get("directory")
+            ]
+        except Exception as exc:
+            return None, str(exc)
+
+        html_path = next(
+            (
+                path
+                for path in paths
+                if Path(path).name in {"dashboard.html", "index.html"}
+            ),
+            next((path for path in paths if path.lower().endswith(".html")), None),
+        )
+        source_path = next(
+            (
+                path
+                for path in paths
+                if Path(path).name in {"app.py", "dashboard.py", "main.py"}
+            ),
+            None,
+        )
+
+        profiles = dataset_profiles or []
+        source: str | None = None
+        if profiles and html_path:
+            try:
+                html_result = await self.dispatcher.dispatch(
+                    "read_file",
+                    {"path": html_path},
+                )
+                content = str(html_result["content"])
+                if not self._dashboard_has_visible_data(content, profiles):
+                    return await self._create_grounded_fallback(profiles, started_ports)
+            except Exception as exc:
+                return None, str(exc)
+
+        if profiles and source_path and not html_path:
+            return await self._create_grounded_fallback(profiles, started_ports)
+
+        if profiles and not html_path and not source_path and started_ports:
+            return await self._create_grounded_fallback(profiles, started_ports)
+
+        # A successful start_webapp call already waits for the sandbox process
+        # to bind its port. Use a generated HTML path when one exists; app
+        # frameworks such as Flask and Streamlit serve their preview at root.
+        if started_ports:
+            port, command = next(iter(started_ports.items()))
+            path = self._static_preview_path(html_path, command)
+            return {
+                "name": html_path or "dashboard",
+                "path": path,
+                "port": port,
+                "type": "webapp",
+            }, None
+
+        if source_path:
+            try:
+                if source is None:
+                    source_result = await self.dispatcher.dispatch(
+                        "read_file",
+                        {"path": source_path},
+                    )
+                    source = str(source_result["content"])
+                quoted_path = shlex.quote(source_path)
+                if "streamlit" in source.lower():
+                    command = (
+                        f"streamlit run {quoted_path} --server.address=0.0.0.0 "
+                        "--server.port=8501 --server.headless=true"
+                    )
+                else:
+                    command = f"python {quoted_path}"
+                await self.dispatcher.dispatch(
+                    "start_webapp",
+                    {"command": command, "port": 8501},
+                )
+                return {
+                    "name": source_path,
+                    "path": None,
+                    "port": 8501,
+                    "type": "webapp",
+                }, None
+            except Exception as exc:
+                return None, str(exc)
+
+        if html_path:
+            try:
+                await self.dispatcher.dispatch(
+                    "start_webapp",
+                    {
+                        "command": "python -m http.server 8501 --bind 0.0.0.0",
+                        "port": 8501,
+                    },
+                )
+                return {
+                    "name": html_path,
+                    "path": html_path,
+                    "port": 8501,
+                    "type": "webapp",
+                }, None
+            except Exception as exc:
+                return None, str(exc)
+
+        return None, "no runnable dashboard source or HTML file was found"
+
+    async def _create_grounded_fallback(
+        self,
+        profiles: list[dict[str, Any]],
+        started_ports: dict[int, str],
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Serve a static, data-grounded view when generated UI content is empty."""
+        try:
+            path = "data_grounded_dashboard.html"
+            await self.dispatcher.dispatch(
+                "write_file",
+                {"path": path, "content": self._grounded_dashboard_html(profiles)},
+            )
+            port = 8502 if 8502 not in started_ports else 8501
+            if port == 8501 and 8501 in started_ports:
+                return None, "all supported preview ports are already in use"
+            await self.dispatcher.dispatch(
+                "start_webapp",
+                {
+                    "command": f"python -m http.server {port} --bind 0.0.0.0",
+                    "port": port,
+                },
+            )
+            return {
+                "name": path,
+                "path": path,
+                "port": port,
+                "type": "webapp",
+            }, None
+        except Exception as exc:
+            return None, str(exc)
+
+    @staticmethod
+    def _dashboard_has_visible_data(
+        content: str,
+        profiles: list[dict[str, Any]],
+    ) -> bool:
+        """Require concrete profile values outside scripts and styles."""
+        visible = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", content, flags=re.I | re.S)
+        visible = re.sub(r"<[^>]+>", " ", visible)
+        visible = html.unescape(visible).lower()
+        if not visible.strip():
+            return False
+
+        metadata_markers: set[str] = set()
+        value_markers: set[str] = set()
+        for profile in profiles:
+            file_name = str(profile.get("file", "")).strip().lower()
+            if file_name:
+                metadata_markers.add(file_name)
+            rows = profile.get("rows")
+            if rows is not None:
+                metadata_markers.update({str(rows).lower(), f"{int(rows):,}".lower()})
+            for column in (profile.get("dtypes") or {}):
+                if str(column).strip():
+                    metadata_markers.add(str(column).strip().lower())
+            for stats in (profile.get("numeric_stats") or {}).values():
+                if not isinstance(stats, dict):
+                    continue
+                for key in ("min", "max", "mean", "median"):
+                    value = stats.get(key)
+                    if value is None:
+                        continue
+                    try:
+                        number = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    value_markers.update(
+                        {
+                            str(value).lower(),
+                            f"{number:g}".lower(),
+                            f"{number:,.2f}".lower(),
+                        }
+                    )
+            for row in profile.get("sample_rows") or []:
+                if not isinstance(row, dict):
+                    continue
+                for value in row.values():
+                    if value is None:
+                        continue
+                    marker = str(value).strip().lower()
+                    if len(marker) >= 3:
+                        value_markers.add(marker)
+
+        def contains_marker(marker: str) -> bool:
+            if not marker:
+                return False
+            if any(character.isalnum() for character in marker):
+                pattern = rf"(?<!\w){re.escape(marker)}(?!\w)"
+                return re.search(pattern, visible) is not None
+            return marker in visible
+
+        has_metadata = any(contains_marker(marker) for marker in metadata_markers)
+        value_matches = {marker for marker in value_markers if contains_marker(marker)}
+        return has_metadata and len(value_matches) >= 2
+
+    @staticmethod
+    def _grounded_dashboard_html(profiles: list[dict[str, Any]]) -> str:
+        cards: list[str] = []
+        insights: list[str] = []
+        samples: list[tuple[str, str]] = []
+        chart_rows: list[str] = []
+        for profile in profiles:
+            file_name = html.escape(str(profile.get("file", profile.get("name", "dataset"))))
+            rows = int(profile.get("rows", 0) or 0)
+            columns = int(profile.get("columns", 0) or 0)
+            cards.append(
+                f'<article class="card"><span class="label">{file_name}</span>'
+                f'<strong>{rows:,}</strong><small>{columns} columns</small></article>'
+            )
+            insights.append(
+                f"<li><b>{file_name}</b> contains {rows:,} rows across "
+                f"{columns} columns.</li>"
+            )
+            for column, stats in (profile.get("numeric_stats") or {}).items():
+                if not isinstance(stats, dict) or stats.get("mean") is None:
+                    continue
+                label = html.escape(str(column))
+                try:
+                    mean = float(stats["mean"])
+                except (TypeError, ValueError):
+                    continue
+                minimum = stats.get("min")
+                maximum = stats.get("max")
+                range_text = ""
+                if minimum is not None and maximum is not None:
+                    try:
+                        range_text = f" (range {float(minimum):g} to {float(maximum):g})"
+                    except (TypeError, ValueError):
+                        range_text = ""
+                try:
+                    upper_bound = max(abs(float(minimum or 0)), abs(float(maximum or 0)), abs(mean), 1)
+                    bar_width = min(100, max(4, abs(mean) / upper_bound * 100))
+                    chart_rows.append(
+                        f'<div class="chart-row"><span>{label}</span>'
+                        f'<div class="track"><i style="width:{bar_width:.1f}%"></i></div>'
+                        f'<b>{mean:,.2f}</b></div>'
+                    )
+                except (TypeError, ValueError):
+                    pass
+                insights.append(
+                    f"<li><b>{label}</b> averages {mean:,.2f}"
+                    f"{html.escape(range_text)}.</li>"
+                )
+            for row in profile.get("sample_rows") or []:
+                if isinstance(row, dict) and len(samples) < 8:
+                    for key, value in list(row.items())[:4]:
+                        samples.append((str(key), str(value)))
+
+        insight_html = "".join(insights[:8]) or "<li>Profiled records are ready for exploration.</li>"
+        sample_html = "".join(
+            f"<tr><th>{html.escape(key)}</th><td>{html.escape(value)}</td></tr>"
+            for key, value in samples
+        )
+        return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Data-grounded dashboard</title>
+<style>
+:root{{--ink:#172033;--muted:#667085;--line:#e5eaf1;--accent:#0d9488;--bg:#f5f7fb}}
+*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--ink);font:15px system-ui,-apple-system,Segoe UI,sans-serif}}
+main{{max-width:1100px;margin:0 auto;padding:40px 28px 56px}}.eyebrow{{color:var(--accent);font-size:12px;font-weight:800;letter-spacing:1.5px;text-transform:uppercase}}
+h1{{font-size:32px;margin:8px 0}}.subtitle{{color:var(--muted);margin:0 0 26px}}
+.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:16px;margin:24px 0}}
+.card,section{{background:white;border:1px solid var(--line);border-radius:14px;padding:20px;box-shadow:0 8px 24px #1720330d}}
+.label,small{{display:block;color:var(--muted);font-size:12px}}strong{{display:block;font-size:30px;margin:9px 0 2px}}
+.grid{{display:grid;grid-template-columns:1fr 1fr;gap:18px}}.wide{{grid-column:1/-1}}
+h2{{font-size:18px;margin:0 0 15px}}li{{margin:12px 0;line-height:1.5}}
+.chart-row{{display:grid;grid-template-columns:170px 1fr 90px;gap:12px;align-items:center;margin:13px 0;font-size:12px}}
+.chart-row span{{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.track{{height:10px;background:#edf1f6;border-radius:9px;overflow:hidden}}
+.track i{{display:block;height:100%;background:linear-gradient(90deg,#0d9488,#5eead4);border-radius:9px}}
+.chart-row b{{text-align:right;color:var(--muted)}}
+table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:1px solid var(--line);padding:8px;text-align:left}}
+@media(max-width:760px){{.grid{{grid-template-columns:1fr}}}}
+</style></head><body><main>
+<div class="eyebrow">Data Copilot · grounded fallback</div><h1>Dataset insights</h1>
+<p class="subtitle">Concrete values computed from the uploaded data.</p>
+<div class="cards">{''.join(cards)}</div>
+<div class="grid"><section><h2>Key insights</h2><ul>{insight_html}</ul></section>
+<section><h2>Sample values from the dataset</h2><table>{sample_html}</table></section></div>
+<section class="wide"><h2>Numeric averages</h2>{''.join(chart_rows) or '<p>No numeric metrics were detected.</p>'}</section>
+</main></body></html>"""
+
+    @staticmethod
+    def _static_preview_path(html_path: str | None, command: str) -> str | None:
+        if not html_path or "http.server" not in command:
+            return None
+        directory = _http_server_directory(command)
+        if directory:
+            prefix = directory.rstrip("/\\") + "/"
+            if html_path.startswith(prefix):
+                return html_path[len(prefix):]
+        return html_path
+
     async def turn(self, content: str) -> AsyncIterator[dict[str, Any]]:
         self.messages.append({"role": "user", "content": content})
         self.dispatcher.record({"type": "user_message", "content": content})
         try:
+            dataset_profiles = self.dataset_context()
             request_messages: list[dict[str, Any]] = [
-                {"role": "system", "content": system_prompt(self.dataset_context())},
+                {"role": "system", "content": system_prompt(dataset_profiles)},
                 *self.messages,
             ]
             final_text = ""
+            dashboard_request = self._is_dashboard_request(content)
+            report_request = self._is_report_request(content)
+            renderable_artifact = False
+            started_ports: dict[int, str] = {}
             for _ in range(4):
                 text_parts: list[str] = []
                 tool_calls: list[tuple[str, str, dict[str, Any], dict[str, Any]]] = []
@@ -504,8 +1000,60 @@ class Agent:
                     yield {"type": "tool_result", "id": tool_id, "tool": item["tool"], **tool_result}
                     if item["tool"] == "run_python":
                         yield {"type": "execution", "status": "complete", **tool_result}
+                    if item["tool"] == "start_webapp":
+                        normalized_command = ToolDispatcher._normalize_webapp_command(
+                            str(arguments.get("command", ""))
+                        )
+                        started_ports[int(tool_result["port"])] = str(
+                            normalized_command
+                        )
+                    if item["tool"] == "stop_webapp":
+                        started_ports.pop(int(tool_result["port"]), None)
                     if item["tool"] == "register_artifact":
-                        for artifact in tool_result["artifacts"]:
+                        artifacts = tool_result["artifacts"]
+                        if report_request:
+                            renderable_artifact = any(
+                                self._is_pdf_artifact(artifact)
+                                for artifact in artifacts
+                            ) or renderable_artifact
+                        elif not dashboard_request:
+                            renderable_artifact = bool(artifacts) or renderable_artifact
+                        for artifact in artifacts:
+                            if dashboard_request and not (
+                                artifact.get("type") == "webapp" and artifact.get("port")
+                            ):
+                                continue
+                            if report_request and not (
+                                self._is_pdf_artifact(artifact)
+                            ):
+                                continue
+                            artifact = dict(artifact)
+                            if report_request:
+                                artifact["type"] = "pdf"
+                            artifact_source_path = artifact.get("path")
+                            if dashboard_request and artifact.get("path"):
+                                command = started_ports.get(int(artifact["port"]), "")
+                                artifact["path"] = self._static_preview_path(
+                                    str(artifact["path"]),
+                                    command,
+                                )
+                            if dashboard_request and dataset_profiles:
+                                artifact_path = artifact_source_path
+                                if artifact_path:
+                                    try:
+                                        content_result = await self.dispatcher.dispatch(
+                                            "read_file",
+                                            {"path": str(artifact_path)},
+                                        )
+                                        if not self._dashboard_has_visible_data(
+                                            str(content_result["content"]),
+                                            dataset_profiles,
+                                        ):
+                                            continue
+                                    except Exception:
+                                        continue
+                            if dashboard_request:
+                                renderable_artifact = True
                             yield {
                                 "type": "artifact",
                                 "name": artifact.get("name"),
@@ -542,11 +1090,60 @@ class Agent:
                             "content": json.dumps(result, default=str),
                         }
                     )
+            if report_request and not renderable_artifact:
+                recovered, recovery_error = await self._recover_pdf_artifact()
+                if recovered:
+                    self.dispatcher.record(
+                        {"type": "artifact_recovered", "artifact": recovered}
+                    )
+                    yield {
+                        "type": "artifact",
+                        "name": recovered["name"],
+                        "path": recovered["path"],
+                        "artifact": recovered,
+                    }
+                    final_text = (
+                        f"{final_text}\n\nThe PDF report is ready in the canvas."
+                        if final_text
+                        else "The PDF report is ready in the canvas."
+                    )
+                else:
+                    notice = (
+                        "I generated report work, but could not put a PDF on the "
+                        f"canvas: {recovery_error}."
+                    )
+                    final_text = f"{final_text}\n\n{notice}" if final_text else notice
+            if dashboard_request and not renderable_artifact:
+                recovered, recovery_error = await self._recover_dashboard_artifact(
+                    started_ports,
+                    dataset_profiles,
+                )
+                if recovered:
+                    self.dispatcher.record(
+                        {"type": "artifact_recovered", "artifact": recovered}
+                    )
+                    yield {
+                        "type": "artifact",
+                        "name": recovered["name"],
+                        "path": recovered.get("path"),
+                        "port": recovered["port"],
+                        "artifact": recovered,
+                    }
+                    final_text = (
+                        f"{final_text}\n\nThe dashboard is now running in the canvas."
+                        if final_text
+                        else "The dashboard is running in the canvas."
+                    )
+                else:
+                    final_text = (
+                        "I generated dashboard work, but could not put a runnable "
+                        f"artifact on the canvas: {recovery_error}."
+                    )
             if final_text:
                 self.messages.append({"role": "assistant", "content": final_text})
                 yield {"type": "assistant_message", "content": final_text}
             else:
-                yield {"type": "assistant_message", "content": "Completed the requested sandbox work."}
+                yield {"type": "assistant_message", "content": "The requested sandbox work finished."}
             yield {"type": "done"}
         except Exception as exc:
             yield {"type": "error", "message": str(exc)}
