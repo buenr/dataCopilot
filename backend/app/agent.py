@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import html
 import json
 import re
 import shlex
@@ -25,6 +24,17 @@ def _workspace_relative(path: Any) -> str:
     if text.startswith("/workspace/"):
         return text[len("/workspace/"):]
     return text
+# Tool-call rounds allowed per turn, for every request. Sixteen gives slower
+# providers room to explore and still author the artifact; two rounds before
+# the cap a wrap-up nudge is folded into the running history so the model
+# spends its last steps writing instead of exploring.
+MAX_TURN_STEPS = 16
+WRAP_UP_NUDGE = (
+    "Step budget nearly exhausted: only 2 tool rounds remain. Stop exploring "
+    "and finish with what you have: write the requested artifact to the "
+    "workspace, call register_artifact, then summarize your findings."
+)
+
 # The kernel preloads WORKSPACE for convenience, but agent code can reassign it,
 # so this snippet resolves the real workspace from the sandbox environment. A
 # wrong destination would silently copy a rescued PDF back onto itself.
@@ -781,75 +791,12 @@ class Agent:
         path = str(artifact.get("path") or artifact.get("name") or "").lower()
         return artifact.get("type") == "pdf" or path.endswith(".pdf")
 
-    @staticmethod
-    def _fallback_pdf_code(content: str) -> str:
-        """Return sandbox code that builds a simple PDF from analysis text.
-
-        Dependency-free (same raw-PDF approach as the mock provider) so it
-        works in both the Docker sandbox and the in-process FakeSandbox.
-        Content is base64-encoded to avoid all escaping issues.
-        """
-        import base64
-
-        content_b64 = base64.b64encode(content.encode()).decode()
-        return '''
-import base64
-import os
-from pathlib import Path
-
-# The kernel preloads WORKSPACE, but agent code can clobber it; the sandbox
-# image always sets SANDBOX_WORKSPACE, so prefer it (same as the rescue sweep).
-workspace = Path(os.environ.get("SANDBOX_WORKSPACE") or WORKSPACE)
-content = base64.b64decode("''' + content_b64 + '''").decode()
-
-lines = content.split("\\n")[:35]
-objects = [
-    b"<< /Type /Catalog /Pages 2 0 R >>",
-    b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-    b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
-]
-parts = []
-y = 700
-for line in lines:
-    esc = line.replace("\\\\", "\\\\\\\\").replace("(", "\\\\(").replace(")", "\\\\)")
-    parts.append("BT /F1 11 Tf 72 " + str(y) + " Td (" + esc + ") Tj ET")
-    y -= 16
-data = "\\n".join(parts).encode()
-objects.append(b"<< /Length " + str(len(data)).encode() + b" >>\\nstream\\n" + data + b"endstream")
-objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
-
-pdf = bytearray(b"%PDF-1.4\\n")
-offsets = [0]
-for i, obj in enumerate(objects, 1):
-    offsets.append(len(pdf))
-    pdf.extend(str(i).encode() + b" 0 obj\\n" + obj + b"\\nendobj\\n")
-xref = len(pdf)
-pdf.extend(b"xref\\n0 " + str(len(objects) + 1).encode() + b"\\n0000000000 65535 f \\n")
-for off in offsets[1:]:
-    pdf.extend(str(off).zfill(10).encode() + b" 00000 n \\n")
-pdf.extend(b"trailer\\n<< /Size " + str(len(objects) + 1).encode() + b" /Root 1 0 R >>\\nstartxref\\n" + str(xref).encode() + b"\\n%%EOF\\n")
-(workspace / "report.pdf").write_bytes(bytes(pdf))
-print("Fallback PDF written")
-'''
-
-    @staticmethod
-    def _dataset_summary_text(profiles: list[dict[str, Any]] | None) -> str:
-        """Minimal report content when a provider produced no text at all."""
-        lines = ["Data Copilot report", ""]
-        for profile in profiles or []:
-            lines.append(
-                f"{profile.get('name', 'dataset')} ({profile.get('file', 'unknown')}): "
-                f"{profile.get('rows', '?')} rows x {profile.get('columns', '?')} columns"
-            )
-        return "\n".join(lines)
-
-    async def _recover_pdf_artifact(
-        self, fallback_content: str = ""
-    ) -> tuple[dict[str, Any] | None, str | None]:
+    async def _recover_pdf_artifact(self) -> tuple[dict[str, Any] | None, str | None]:
         """Recover a PDF when a provider wrote it but omitted the handoff.
 
-        If no PDF exists after the rescue sweep, generate one from the
-        assistant's analysis text so the user always gets a canvas artifact.
+        Only a real PDF found in the sandbox is published. When the provider
+        never wrote one, the caller says so instead of fabricating a document
+        from raw tool output.
         """
         async def find_pdf() -> str | None:
             listing = await self.dispatcher.dispatch("list_files", {"path": "."})
@@ -881,20 +828,7 @@ print("Fallback PDF written")
             if not pdf_path and not hasattr(self.dispatcher.sandbox, "root"):
                 await self.dispatcher.dispatch("run_python", {"code": PDF_RESCUE_CODE})
                 pdf_path = await find_pdf()
-            fallback_result: dict[str, Any] = {}
             if not pdf_path:
-                # The provider ran analysis but never wrote a PDF. Build one
-                # from the collected output so the canvas is not empty.
-                fallback_result = await self.dispatcher.dispatch(
-                    "run_python", {"code": self._fallback_pdf_code(fallback_content)}
-                )
-                pdf_path = await find_pdf()
-            if not pdf_path:
-                # run_python reports code failures as stderr, not exceptions, so
-                # surface the real reason instead of a generic "not found".
-                stderr = str(fallback_result.get("stderr") or "").strip()
-                if stderr:
-                    return None, f"the fallback PDF generator failed: {stderr.splitlines()[-1]}"
                 return None, "no PDF artifact was found in the sandbox workspace"
             artifact_result = await self.dispatcher.dispatch(
                 "register_artifact",
@@ -918,9 +852,12 @@ print("Fallback PDF written")
     async def _recover_dashboard_artifact(
         self,
         started_ports: dict[int, str],
-        dataset_profiles: list[dict[str, Any]] | None = None,
     ) -> tuple[dict[str, Any] | None, str | None]:
-        """Finish the canvas handoff when a provider stopped after writing code."""
+        """Finish the canvas handoff when a provider stopped after writing code.
+
+        Only files the provider actually wrote are served. When nothing usable
+        exists, the caller says so instead of serving a generated placeholder.
+        """
         try:
             listing = await self.dispatcher.dispatch("list_files", {"path": "."})
             files = listing.get("files", [])
@@ -949,25 +886,7 @@ print("Fallback PDF written")
             None,
         )
 
-        profiles = dataset_profiles or []
         source: str | None = None
-        if profiles and html_path:
-            try:
-                html_result = await self.dispatcher.dispatch(
-                    "read_file",
-                    {"path": html_path},
-                )
-                content = str(html_result["content"])
-                if not self._dashboard_has_visible_data(content, profiles):
-                    return await self._create_grounded_fallback(profiles, started_ports)
-            except Exception as exc:
-                return None, str(exc)
-
-        if profiles and source_path and not html_path:
-            return await self._create_grounded_fallback(profiles, started_ports)
-
-        if profiles and not html_path and not source_path and started_ports:
-            return await self._create_grounded_fallback(profiles, started_ports)
 
         # A successful start_webapp call already waits for the sandbox process
         # to bind its port. Use a generated HTML path when one exists; app
@@ -1030,187 +949,6 @@ print("Fallback PDF written")
                 return None, str(exc)
 
         return None, "no runnable dashboard source or HTML file was found"
-
-    async def _create_grounded_fallback(
-        self,
-        profiles: list[dict[str, Any]],
-        started_ports: dict[int, str],
-    ) -> tuple[dict[str, Any] | None, str | None]:
-        """Serve a static, data-grounded view when generated UI content is empty."""
-        try:
-            path = "data_grounded_dashboard.html"
-            await self.dispatcher.dispatch(
-                "write_file",
-                {"path": path, "content": self._grounded_dashboard_html(profiles)},
-            )
-            port = 8502 if 8502 not in started_ports else 8501
-            if port == 8501 and 8501 in started_ports:
-                return None, "all supported preview ports are already in use"
-            await self.dispatcher.dispatch(
-                "start_webapp",
-                {
-                    "command": f"python -m http.server {port} --bind 0.0.0.0",
-                    "port": port,
-                },
-            )
-            return {
-                "name": path,
-                "path": path,
-                "port": port,
-                "type": "webapp",
-            }, None
-        except Exception as exc:
-            return None, str(exc)
-
-    @staticmethod
-    def _dashboard_has_visible_data(
-        content: str,
-        profiles: list[dict[str, Any]],
-    ) -> bool:
-        """Require concrete profile values outside scripts and styles."""
-        visible = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", content, flags=re.IGNORECASE | re.DOTALL)
-        visible = re.sub(r"<[^>]+>", " ", visible)
-        visible = html.unescape(visible).lower()
-        if not visible.strip():
-            return False
-
-        metadata_markers: set[str] = set()
-        value_markers: set[str] = set()
-        for profile in profiles:
-            file_name = str(profile.get("file", "")).strip().lower()
-            if file_name:
-                metadata_markers.add(file_name)
-            rows = profile.get("rows")
-            if rows is not None:
-                metadata_markers.update({str(rows).lower(), f"{int(rows):,}".lower()})
-            for column in (profile.get("dtypes") or {}):
-                if str(column).strip():
-                    metadata_markers.add(str(column).strip().lower())
-            for stats in (profile.get("numeric_stats") or {}).values():
-                if not isinstance(stats, dict):
-                    continue
-                for key in ("min", "max", "mean", "median"):
-                    value = stats.get(key)
-                    if value is None:
-                        continue
-                    try:
-                        number = float(value)
-                    except (TypeError, ValueError):
-                        continue
-                    value_markers.update(
-                        {
-                            str(value).lower(),
-                            f"{number:g}".lower(),
-                            f"{number:,.2f}".lower(),
-                        }
-                    )
-            for row in profile.get("sample_rows") or []:
-                if not isinstance(row, dict):
-                    continue
-                for value in row.values():
-                    if value is None:
-                        continue
-                    marker = str(value).strip().lower()
-                    if len(marker) >= 3:
-                        value_markers.add(marker)
-
-        def contains_marker(marker: str) -> bool:
-            if not marker:
-                return False
-            if any(character.isalnum() for character in marker):
-                pattern = rf"(?<!\w){re.escape(marker)}(?!\w)"
-                return re.search(pattern, visible) is not None
-            return marker in visible
-
-        has_metadata = any(contains_marker(marker) for marker in metadata_markers)
-        value_matches = {marker for marker in value_markers if contains_marker(marker)}
-        return has_metadata and len(value_matches) >= 2
-
-    @staticmethod
-    def _grounded_dashboard_html(profiles: list[dict[str, Any]]) -> str:
-        cards: list[str] = []
-        insights: list[str] = []
-        samples: list[tuple[str, str]] = []
-        chart_rows: list[str] = []
-        for profile in profiles:
-            file_name = html.escape(str(profile.get("file", profile.get("name", "dataset"))))
-            rows = int(profile.get("rows", 0) or 0)
-            columns = int(profile.get("columns", 0) or 0)
-            cards.append(
-                f'<article class="card"><span class="label">{file_name}</span>'
-                f'<strong>{rows:,}</strong><small>{columns} columns</small></article>'
-            )
-            insights.append(
-                f"<li><b>{file_name}</b> contains {rows:,} rows across "
-                f"{columns} columns.</li>"
-            )
-            for column, stats in (profile.get("numeric_stats") or {}).items():
-                if not isinstance(stats, dict) or stats.get("mean") is None:
-                    continue
-                label = html.escape(str(column))
-                try:
-                    mean = float(stats["mean"])
-                except (TypeError, ValueError):
-                    continue
-                minimum = stats.get("min")
-                maximum = stats.get("max")
-                range_text = ""
-                if minimum is not None and maximum is not None:
-                    try:
-                        range_text = f" (range {float(minimum):g} to {float(maximum):g})"
-                    except (TypeError, ValueError):
-                        range_text = ""
-                try:
-                    upper_bound = max(abs(float(minimum or 0)), abs(float(maximum or 0)), abs(mean), 1)
-                    bar_width = min(100, max(4, abs(mean) / upper_bound * 100))
-                    chart_rows.append(
-                        f'<div class="chart-row"><span>{label}</span>'
-                        f'<div class="track"><i style="width:{bar_width:.1f}%"></i></div>'
-                        f'<b>{mean:,.2f}</b></div>'
-                    )
-                except (TypeError, ValueError):
-                    pass
-                insights.append(
-                    f"<li><b>{label}</b> averages {mean:,.2f}"
-                    f"{html.escape(range_text)}.</li>"
-                )
-            for row in profile.get("sample_rows") or []:
-                if isinstance(row, dict) and len(samples) < 8:
-                    for key, value in list(row.items())[:4]:
-                        samples.append((str(key), str(value)))
-
-        insight_html = "".join(insights[:8]) or "<li>Profiled records are ready for exploration.</li>"
-        sample_html = "".join(
-            f"<tr><th>{html.escape(key)}</th><td>{html.escape(value)}</td></tr>"
-            for key, value in samples
-        )
-        return f"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Data-grounded dashboard</title>
-<style>
-:root{{--ink:#172033;--muted:#667085;--line:#e5eaf1;--accent:#0d9488;--bg:#f5f7fb}}
-*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--ink);font:15px system-ui,-apple-system,Segoe UI,sans-serif}}
-main{{max-width:1100px;margin:0 auto;padding:40px 28px 56px}}.eyebrow{{color:var(--accent);font-size:12px;font-weight:800;letter-spacing:1.5px;text-transform:uppercase}}
-h1{{font-size:32px;margin:8px 0}}.subtitle{{color:var(--muted);margin:0 0 26px}}
-.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:16px;margin:24px 0}}
-.card,section{{background:white;border:1px solid var(--line);border-radius:14px;padding:20px;box-shadow:0 8px 24px #1720330d}}
-.label,small{{display:block;color:var(--muted);font-size:12px}}strong{{display:block;font-size:30px;margin:9px 0 2px}}
-.grid{{display:grid;grid-template-columns:1fr 1fr;gap:18px}}.wide{{grid-column:1/-1}}
-h2{{font-size:18px;margin:0 0 15px}}li{{margin:12px 0;line-height:1.5}}
-.chart-row{{display:grid;grid-template-columns:170px 1fr 90px;gap:12px;align-items:center;margin:13px 0;font-size:12px}}
-.chart-row span{{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.track{{height:10px;background:#edf1f6;border-radius:9px;overflow:hidden}}
-.track i{{display:block;height:100%;background:linear-gradient(90deg,#0d9488,#5eead4);border-radius:9px}}
-.chart-row b{{text-align:right;color:var(--muted)}}
-table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:1px solid var(--line);padding:8px;text-align:left}}
-@media(max-width:760px){{.grid{{grid-template-columns:1fr}}}}
-</style></head><body><main>
-<div class="eyebrow">Data Copilot · grounded fallback</div><h1>Dataset insights</h1>
-<p class="subtitle">Concrete values computed from the uploaded data.</p>
-<div class="cards">{''.join(cards)}</div>
-<div class="grid"><section><h2>Key insights</h2><ul>{insight_html}</ul></section>
-<section><h2>Sample values from the dataset</h2><table>{sample_html}</table></section></div>
-<section class="wide"><h2>Numeric averages</h2>{''.join(chart_rows) or '<p>No numeric metrics were detected.</p>'}</section>
-</main></body></html>"""
 
     @staticmethod
     def _static_preview_path(html_path: str | None, command: str) -> str | None:
@@ -1278,11 +1016,15 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
             published_pdf = False
             published_webapp = False
             started_ports: dict[int, str] = {}
-            all_text: list[str] = []
-            run_python_outputs: list[str] = []
-            # Eight rounds give slower providers room to explore and still write
-            # the artifact; the fallback below covers turns that exhaust it.
-            for _ in range(8):
+            # The nudge is folded into the latest tool result rather than sent
+            # as its own message: mid-conversation system messages are dropped
+            # by the Anthropic and OpenAI Responses adapters, and a bare user
+            # message would break Anthropic's role alternation.
+            steps_exhausted = True
+            for step in range(MAX_TURN_STEPS):
+                if step == MAX_TURN_STEPS - 2 and request_messages[-1].get("role") == "tool":
+                    request_messages[-1]["content"] += "\n\n" + WRAP_UP_NUDGE
+                    self.dispatcher.record({"type": "wrap_up_nudge", "step": step + 1})
                 text_parts: list[str] = []
                 tool_calls: list[tuple[str, str, dict[str, Any], dict[str, Any]]] = []
                 async for item in self.provider.stream(request_messages, TOOL_DEFINITIONS):
@@ -1332,9 +1074,6 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
                     tool_calls.append((provider_call_id, item["tool"], arguments, tool_result))
                     yield {"type": "tool_result", "id": tool_id, "tool": item["tool"], **tool_result}
                     if item["tool"] == "run_python":
-                        stdout = str(tool_result.get("stdout", ""))
-                        if stdout.strip():
-                            run_python_outputs.append(stdout.strip())
                         try:
                             variables = await self.dispatcher.sandbox.vars()
                         except Exception:
@@ -1374,30 +1113,12 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
                             artifact = dict(artifact)
                             if report_request and is_pdf:
                                 artifact["type"] = "pdf"
-                            artifact_source_path = artifact.get("path")
                             if dashboard_request and is_webapp and artifact.get("path"):
                                 command = started_ports.get(int(artifact["port"]), "")
                                 artifact["path"] = self._static_preview_path(
                                     str(artifact["path"]),
                                     command,
                                 )
-                            if dashboard_request and is_webapp and dataset_profiles:
-                                artifact_path = artifact_source_path
-                                if artifact_path:
-                                    try:
-                                        content_result = await self.dispatcher.dispatch(
-                                            "read_file",
-                                            {"path": str(artifact_path)},
-                                        )
-                                        if not self._dashboard_has_visible_data(
-                                            str(content_result["content"]),
-                                            dataset_profiles,
-                                        ):
-                                            continue
-                                    except Exception:
-                                        # A read hiccup says nothing about the
-                                        # dashboard's content; still publish it.
-                                        pass
                             if is_webapp:
                                 published_webapp = True
                             if is_pdf:
@@ -1410,9 +1131,8 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
                                 "artifact": artifact,
                             }
                 final_text = "".join(text_parts)
-                if final_text:
-                    all_text.append(final_text)
                 if not tool_calls:
+                    steps_exhausted = False
                     break
                 request_messages.append(
                     {
@@ -1441,14 +1161,7 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
                         }
                     )
             if report_request and not published_pdf:
-                fallback_content = "\n\n".join(all_text or run_python_outputs)
-                if not fallback_content:
-                    # The provider hit the step cap without saying anything;
-                    # fall back to a dataset summary so the PDF still has content.
-                    fallback_content = self._dataset_summary_text(dataset_profiles)
-                recovered, recovery_error = await self._recover_pdf_artifact(
-                    fallback_content
-                )
+                recovered, recovery_error = await self._recover_pdf_artifact()
                 if recovered:
                     self.dispatcher.record(
                         {"type": "artifact_recovered", "artifact": recovered}
@@ -1464,16 +1177,29 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
                         if final_text
                         else "The PDF report is ready in the canvas."
                     )
+                elif steps_exhausted:
+                    notice = (
+                        "I ran out of steps before I could finish the PDF report, "
+                        "so nothing was published to the canvas. Ask me to "
+                        "continue and I'll pick up where I left off."
+                    )
+                    final_text = f"{final_text}\n\n{notice}" if final_text else notice
                 else:
                     notice = (
                         "I generated report work, but could not put a PDF on the "
                         f"canvas: {recovery_error}."
                     )
                     final_text = f"{final_text}\n\n{notice}" if final_text else notice
+            elif steps_exhausted and not dashboard_request:
+                notice = (
+                    "I ran out of steps before finishing, so this answer may be "
+                    "incomplete. Ask me to continue and I'll pick up where I "
+                    "left off."
+                )
+                final_text = f"{final_text}\n\n{notice}" if final_text else notice
             if dashboard_request and not published_webapp:
                 recovered, recovery_error = await self._recover_dashboard_artifact(
                     started_ports,
-                    dataset_profiles,
                 )
                 if recovered:
                     self.dispatcher.record(
@@ -1491,11 +1217,19 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
                         if final_text
                         else "The dashboard is running in the canvas."
                     )
+                elif steps_exhausted:
+                    notice = (
+                        "I ran out of steps before I could finish the dashboard, "
+                        "so nothing was published to the canvas. Ask me to "
+                        "continue and I'll pick up where I left off."
+                    )
+                    final_text = f"{final_text}\n\n{notice}" if final_text else notice
                 else:
-                    final_text = (
+                    notice = (
                         "I generated dashboard work, but could not put a runnable "
                         f"artifact on the canvas: {recovery_error}."
                     )
+                    final_text = f"{final_text}\n\n{notice}" if final_text else notice
             if final_text:
                 self.messages.append({"role": "assistant", "content": final_text})
                 yield {"type": "assistant_message", "content": final_text}
