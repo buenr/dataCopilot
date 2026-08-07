@@ -84,6 +84,7 @@ export default function App() {
     setConnection,
     addMessage,
     appendAssistantDelta,
+    setAssistantMessage,
     finishAssistant,
     addDataset,
     setArtifact,
@@ -110,7 +111,7 @@ export default function App() {
         appendAssistantDelta(textValue(payload.delta ?? payload.content ?? payload.text));
         break;
       case 'assistant_message':
-        appendAssistantDelta(textValue(payload.content ?? payload.message ?? payload.text));
+        setAssistantMessage(textValue(payload.content ?? payload.message ?? payload.text));
         finishAssistant();
         break;
       case 'tool_start': {

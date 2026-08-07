@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from app.agent import PDF_RESCUE_CODE, Agent, MockProvider, ToolDispatcher
+from app.agent import PDF_RESCUE_CODE, Agent, AnthropicProvider, MockProvider, ToolDispatcher
 from app.sandbox import FakeSandbox
 
 
@@ -486,3 +486,107 @@ def test_pdf_rescue_leaves_workspace_files_untouched(tmp_path: Path, monkeypatch
 
     assert not (workspace / "whitepaper.pdf").exists()
     assert sorted(path.name for path in workspace.rglob("*.pdf")) == ["whitepaper.pdf"]
+
+
+def test_anthropic_history_maps_openai_tool_flow_to_content_blocks():
+    messages = [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "analyze the data"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "run_python", "arguments": "{\"code\": \"print(1)\"}"},
+                },
+                {
+                    "id": "call-2",
+                    "type": "function",
+                    "function": {"name": "list_files", "arguments": "{}"},
+                },
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "name": "run_python", "content": "{\"stdout\": \"1\"}"},
+        {"role": "tool", "tool_call_id": "call-2", "name": "list_files", "content": "{\"files\": []}"},
+        {"role": "assistant", "content": "The answer is 1."},
+    ]
+
+    converted = AnthropicProvider._convert_messages(messages)
+
+    assert converted[0] == {"role": "user", "content": "analyze the data"}
+    assistant = converted[1]
+    assert assistant["role"] == "assistant"
+    assert [block["type"] for block in assistant["content"]] == ["tool_use", "tool_use"]
+    assert assistant["content"][0]["id"] == "call-1"
+    assert assistant["content"][0]["input"] == {"code": "print(1)"}
+    tool_results = converted[2]
+    assert tool_results["role"] == "user"
+    assert [block["type"] for block in tool_results["content"]] == ["tool_result", "tool_result"]
+    assert [block["tool_use_id"] for block in tool_results["content"]] == ["call-1", "call-2"]
+    assert converted[3] == {"role": "assistant", "content": "The answer is 1."}
+
+
+@pytest.mark.asyncio
+async def test_mock_provider_wraps_up_after_tool_results(tmp_path: Path):
+    sandbox = FakeSandbox("mock-loop", tmp_path / "workspace")
+
+    class CountingMockProvider(MockProvider):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream(self, messages, tools):
+            self.calls += 1
+            async for item in super().stream(messages, tools):
+                yield item
+
+    provider = CountingMockProvider()
+    agent = Agent(sandbox, provider, "mock-loop", tmp_path / "sessions")
+    try:
+        events = [event async for event in agent.turn("build a dashboard")]
+    finally:
+        await sandbox.close()
+
+    # One tool round plus one wrap-up call; previously the tool result payload
+    # re-matched "dashboard" and re-ran every tool until the turn cap.
+    assert provider.calls == 2
+    starts = [
+        event
+        for event in events
+        if event.get("type") == "tool_start" and event.get("tool") == "run_python"
+    ]
+    assert len(starts) == 1
+
+
+@pytest.mark.asyncio
+async def test_run_with_retries_does_not_repeat_code_that_produced_output(tmp_path: Path):
+    sandbox = FakeSandbox("retry", tmp_path / "workspace")
+    dispatcher = ToolDispatcher(sandbox, "retry", tmp_path / "sessions")
+
+    execution = await dispatcher._run_with_retries(
+        "import sys\n"
+        "with open(WORKSPACE / 'marker.txt', 'a') as handle:\n"
+        "    handle.write('x')\n"
+        "print('done')\n"
+        "sys.stderr.write('DeprecationWarning: noisy library\\n')\n"
+    )
+
+    assert execution.stdout.strip() == "done"
+    # A warning on stderr must not cause side-effecting code to run again.
+    assert (sandbox.root / "marker.txt").read_text() == "x"
+
+
+@pytest.mark.asyncio
+async def test_run_with_retries_still_retries_bare_failures(tmp_path: Path):
+    sandbox = FakeSandbox("retry-bare", tmp_path / "workspace")
+    dispatcher = ToolDispatcher(sandbox, "retry-bare", tmp_path / "sessions")
+
+    execution = await dispatcher._run_with_retries(
+        "with open(WORKSPACE / 'attempts.txt', 'a') as handle:\n"
+        "    handle.write('x')\n"
+        "raise RuntimeError('boom')\n"
+    )
+
+    assert "RuntimeError" in execution.stderr
+    assert (sandbox.root / "attempts.txt").read_text() == "xxxx"  # initial run + 3 retries

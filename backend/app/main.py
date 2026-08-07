@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import mimetypes
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -188,7 +189,10 @@ def create_app(settings: Settings | None = None, manager: SessionManager | None 
                 "for key in list(globals()):\n"
                 "    if key.startswith('df_'):\n"
                 "        del globals()[key]\n"
-                "for i, path in enumerate(sorted(data_root.iterdir()), 1):\n"
+                # Filter before numbering so df_N matches profiling.profile_files;
+                # enumerating all files would shift indices past unsupported ones.
+                "paths = [p for p in sorted(data_root.iterdir()) if p.is_file() and p.suffix.lower() in ('.csv', '.xls', '.xlsx', '.parquet', '.json')]\n"
+                "for i, path in enumerate(paths, 1):\n"
                 "    suffix = path.suffix.lower()\n"
                 "    if suffix == '.csv':\n"
                 "        frame = pd.read_csv(path)\n"
@@ -196,10 +200,8 @@ def create_app(settings: Settings | None = None, manager: SessionManager | None 
                 "        frame = pd.read_excel(path)\n"
                 "    elif suffix == '.parquet':\n"
                 "        frame = pd.read_parquet(path)\n"
-                "    elif suffix == '.json':\n"
-                "        frame = pd.read_json(path)\n"
                 "    else:\n"
-                "        continue\n"
+                "        frame = pd.read_json(path)\n"
                 "    globals()[f'df_{i}'] = frame\n"
             )
             result = await session.sandbox.exec(bootstrap)
@@ -217,7 +219,9 @@ def create_app(settings: Settings | None = None, manager: SessionManager | None 
                 "    if key.startswith('df_'):\n"
                 "        del globals()[key]\n"
                 "out = []\n"
-                "for i, path in enumerate(sorted(data_root.iterdir()), 1):\n"
+                # Same filter-then-number rule as profiling.profile_files.
+                "paths = [p for p in sorted(data_root.iterdir()) if p.is_file() and p.suffix.lower() in ('.csv', '.xls', '.xlsx', '.parquet', '.json')]\n"
+                "for i, path in enumerate(paths, 1):\n"
                 "    suffix = path.suffix.lower()\n"
                 "    if suffix == '.csv':\n"
                 "        frame = pd.read_csv(path)\n"
@@ -225,10 +229,8 @@ def create_app(settings: Settings | None = None, manager: SessionManager | None 
                 "        frame = pd.read_excel(path)\n"
                 "    elif suffix == '.parquet':\n"
                 "        frame = pd.read_parquet(path)\n"
-                "    elif suffix == '.json':\n"
-                "        frame = pd.read_json(path)\n"
                 "    else:\n"
-                "        continue\n"
+                "        frame = pd.read_json(path)\n"
                 "    globals()[f'df_{i}'] = frame\n"
                 "    numeric = frame.select_dtypes(include='number')\n"
                 "    out.append({'name': f'df_{i}', 'file': path.name, 'rows': int(frame.shape[0]), 'columns': int(frame.shape[1]), 'dtypes': {str(k): str(v) for k, v in frame.dtypes.items()}, 'null_percentages': {str(k): float(frame[k].isna().mean()*100) for k in frame.columns}, 'numeric_stats': {str(k): {'min': float(v.min()) if not v.dropna().empty else None, 'max': float(v.max()) if not v.dropna().empty else None, 'mean': float(v.mean()) if not v.dropna().empty else None, 'median': float(v.median()) if not v.dropna().empty else None} for k, v in numeric.items()}, 'sample_rows': frame.head(5).to_dict(orient='records')})\n"
@@ -269,14 +271,22 @@ def create_app(settings: Settings | None = None, manager: SessionManager | None 
     async def preview(request: Request, session_id: str, port: int, path: str = "") -> Response:
         try:
             session = session_manager.get(session_id)
-            mapped_port = session.sandbox.preview_ports.get(port, port)
+        except KeyError as exc:
+            raise HTTPException(404, "preview unavailable") from exc
+        mapped_port = session.sandbox.preview_ports.get(port)
+        if mapped_port is None:
+            # Never dial a client-supplied port: only ports a webapp registered
+            # through start_webapp may be proxied, otherwise this endpoint is a
+            # loopback SSRF into the host.
+            raise HTTPException(404, "preview port is not registered for this session")
+        try:
             target = preview_target(
                 mapped_port,
                 path,
                 request.url.query,
                 host=session.sandbox.preview_host,
             )
-        except (KeyError, ValueError) as exc:
+        except ValueError as exc:
             raise HTTPException(404, "preview unavailable") from exc
         body = await request.body()
         headers = {key: value for key, value in request.headers.items() if key.lower() in {"accept", "content-type", "range", "user-agent"}}
@@ -305,7 +315,15 @@ def create_app(settings: Settings | None = None, manager: SessionManager | None 
         """Relay app websocket traffic (for example Streamlit's _stcore stream)."""
         try:
             session = session_manager.get(session_id)
-            mapped = session.sandbox.preview_ports.get(port, port)
+        except KeyError:
+            await websocket.close(code=4404)
+            return
+        mapped = session.sandbox.preview_ports.get(port)
+        if mapped is None:
+            # Same loopback-SSRF guard as the HTTP preview proxy above.
+            await websocket.close(code=4404)
+            return
+        try:
             target = preview_target(
                 mapped,
                 path,
@@ -313,7 +331,7 @@ def create_app(settings: Settings | None = None, manager: SessionManager | None 
                 host=session.sandbox.preview_host,
             ).replace("http://", "ws://", 1)
             import websockets
-        except (KeyError, ValueError, ImportError):
+        except (ValueError, ImportError):
             await websocket.close(code=4404)
             return
         await websocket.accept()
@@ -359,8 +377,16 @@ def create_app(settings: Settings | None = None, manager: SessionManager | None 
         )
         try:
             while True:
-                payload = await websocket.receive_json()
-                if payload.get("type") != "user_message" or not isinstance(payload.get("content"), str):
+                try:
+                    payload = await websocket.receive_json()
+                except json.JSONDecodeError:
+                    # One bad frame must not kill the socket (and its session).
+                    await websocket.send_json({"type": "error", "message": "malformed JSON message"})
+                    continue
+                # Chat traffic is activity too: without this the reaper destroys
+                # the container mid-conversation once the connect-time TTL elapses.
+                session_manager.touch(session_id)
+                if not isinstance(payload, dict) or payload.get("type") != "user_message" or not isinstance(payload.get("content"), str):
                     await websocket.send_json({"type": "error", "message": "expected a user_message"})
                     continue
                 await websocket.send_json({"type": "user_message", "content": payload["content"]})

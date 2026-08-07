@@ -174,40 +174,47 @@ class DockerSandbox:
                     driver="bridge",
                     options={"com.docker.network.bridge.enable_ip_masquerade": "false"},
                 )
-        container = client.containers.run(
-            settings.sandbox_image,
-            detach=True,
-            name=f"dc-sandbox-{session_id}",
-            volumes={volume_name: {"bind": "/workspace", "mode": "rw"}},
-            ports={f"{port}/tcp": ("127.0.0.1", 0) for port in ports},
-            nano_cpus=2_000_000_000,
-            mem_limit="4g",
-            pids_limit=512,
-            cap_drop=["ALL"],
-            security_opt=["no-new-privileges:true"],
-            tmpfs={"/tmp": "rw,noexec,nosuid,size=512m"},
-            network=network_name,
-            environment={"SANDBOX_ALLOW_EGRESS": str(settings.sandbox_allow_egress).lower()},
-        )
-        container.reload()
-        bindings = container.attrs.get("NetworkSettings", {}).get("Ports", {})
-        mapped = {}
-        for port in ports:
-            values = bindings.get(f"{port}/tcp") or []
-            mapped[port] = int(values[0]["HostPort"]) if values else port
-        sandbox = cls(
-            session_id,
-            container,
-            client=client,
-            preview_ports=mapped,
-            preview_host="127.0.0.1",
-            volume_name=volume_name,
-        )
+        container = None
         try:
+            container = client.containers.run(
+                settings.sandbox_image,
+                detach=True,
+                name=f"dc-sandbox-{session_id}",
+                volumes={volume_name: {"bind": "/workspace", "mode": "rw"}},
+                ports={f"{port}/tcp": ("127.0.0.1", 0) for port in ports},
+                nano_cpus=2_000_000_000,
+                mem_limit="4g",
+                pids_limit=512,
+                cap_drop=["ALL"],
+                security_opt=["no-new-privileges:true"],
+                tmpfs={"/tmp": "rw,noexec,nosuid,size=512m"},
+                network=network_name,
+                environment={"SANDBOX_ALLOW_EGRESS": str(settings.sandbox_allow_egress).lower()},
+            )
+            container.reload()
+            bindings = container.attrs.get("NetworkSettings", {}).get("Ports", {})
+            mapped = {}
+            for port in ports:
+                values = bindings.get(f"{port}/tcp") or []
+                mapped[port] = int(values[0]["HostPort"]) if values else port
+            sandbox = cls(
+                session_id,
+                container,
+                client=client,
+                preview_ports=mapped,
+                preview_host="127.0.0.1",
+                volume_name=volume_name,
+            )
             sandbox.wait_ready()
         except Exception:
+            # A partial provision must not leak the container or the
+            # per-session volume (previously only wait_ready failures cleaned up).
+            if container is not None:
+                try:
+                    container.remove(force=True)
+                except Exception:
+                    pass
             try:
-                container.remove(force=True)
                 client.volumes.get(volume_name).remove()
             except Exception:
                 pass
@@ -302,7 +309,10 @@ class SessionManager:
     async def create(self) -> ManagedSession:
         from datetime import datetime, timezone
         sid = str(uuid.uuid4())
-        sandbox = self.sandbox_factory(sid)
+        # Provisioning blocks on the Docker SDK (container start plus kernel
+        # health polling can take many seconds); keep it off the event loop so
+        # one session creation cannot stall every other session.
+        sandbox = await asyncio.to_thread(self.sandbox_factory, sid)
         if asyncio.iscoroutine(sandbox):
             sandbox = await sandbox
         session = ManagedSession(sid, sandbox, datetime.now(timezone.utc).isoformat(), asyncio.get_running_loop().time())
@@ -317,6 +327,13 @@ class SessionManager:
             raise KeyError("session not found") from exc
         session.last_activity = asyncio.get_running_loop().time()
         return session
+
+    def touch(self, session_id: str) -> None:
+        """Refresh idle timing for long-lived channels (e.g. the chat websocket)
+        that hold a session reference without going through get()."""
+        session = self.sessions.get(session_id)
+        if session is not None:
+            session.last_activity = asyncio.get_running_loop().time()
 
     async def delete(self, session_id: str) -> None:
         session = self.sessions.pop(session_id, None)
