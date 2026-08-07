@@ -112,7 +112,7 @@ Requirements:
 Install dependencies and build the sandbox image:
 
 ```bash
-uv sync
+uv sync --all-extras
 cd frontend && npm install && cd ..
 cp .env.example .env
 docker build -t data-copilot-sandbox:latest sandbox
@@ -260,7 +260,7 @@ the gateway binding all interfaces — carry inline `# noqa` / `# nosec` /
 
 `.github/workflows/ci.yml` runs on every pull request and push to `main`/`develop`:
 
-- **python** — ruff, ty, bandit, and pytest via `uv sync --locked`
+- **python** — ruff, ty, bandit, and pytest via `uv sync --locked --all-extras`
 - **frontend** — `npm ci`, typecheck, and production build
 - **security** — semgrep plus a full-history gitleaks secret scan
 - **actionlint** — lints the workflow files themselves

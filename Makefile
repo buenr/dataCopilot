@@ -1,7 +1,7 @@
 .PHONY: install backend frontend test lint build-sandbox smoke e2e
 
 install:
-	uv sync
+	uv sync --all-extras
 	cd frontend && npm install
 
 backend:
