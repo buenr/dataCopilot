@@ -221,8 +221,8 @@ __marimo__/
 node_modules/
 frontend/dist/
 frontend/.vite/
+frontend/test-results/
+frontend/playwright-report/
 *.tsbuildinfo
-frontend/vite.config.js
-frontend/vite.config.d.ts
 sessions/*
 !sessions/.gitkeep

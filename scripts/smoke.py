@@ -40,11 +40,13 @@ async def collect_turn(websocket: Any, prompt: str) -> list[dict[str, object]]:
 async def docker_smoke(base: str) -> int:
     from websockets.asyncio.client import connect
 
-    sample = Path(__file__).resolve().parents[1] / "sample_data" / "sales.csv"
+    # Blocking Path calls are fine here: the smoke script's loop serves nothing else.
+    sample = Path(__file__).resolve().parents[1] / "sample_data" / "sales.csv"  # noqa: ASYNC240
     async with httpx.AsyncClient(base_url=base, timeout=120) as client:
         session = await client.post("/api/sessions")
         session.raise_for_status()
         session_id = session.json()["id"]
+        exit_code = 0
         try:
             with sample.open("rb") as handle:
                 upload = await client.post(
@@ -84,12 +86,15 @@ async def docker_smoke(base: str) -> int:
                 assert report.content.startswith(b"%PDF") and b"/Count 2" in report.content
                 print("PASS PDF artifact/download")
         finally:
+            # Cleanup must run even when an assertion fails, but a return here
+            # would swallow the original failure, so defer the exit code.
             deleted = await client.delete(f"/api/sessions/{session_id}")
             if deleted.status_code != 204:
                 print(f"FAIL session delete: {deleted.status_code}")
-                return 1
-            print("PASS session delete")
-    return 0
+                exit_code = 1
+            else:
+                print("PASS session delete")
+    return exit_code
 
 
 def main() -> int:

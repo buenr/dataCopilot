@@ -1,0 +1,7 @@
+[bandit]
+# CI runs `bandit -r backend/app scripts -ll`: the gateway and scripts only,
+# medium severity and up. sandboxd's entire purpose is executing agent code
+# (exec, shell=True) and the test suite relies on plain asserts, so both are
+# excluded here for bare `bandit -r .` runs as well. The by-design cases in
+# backend/app carry individual `# nosec` justifications.
+exclude_dirs = sandbox,backend/tests,frontend,sessions,node_modules

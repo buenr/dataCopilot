@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from urllib.parse import quote
-
 
 def parse_preview_path(port: str | int, path: str = "") -> tuple[int, str]:
     number = int(port)

@@ -7,10 +7,11 @@ import html
 import json
 import re
 import shlex
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Protocol
+from typing import Any, Protocol
 
 from .sandbox import EventCallback, Execution, Sandbox
 
@@ -140,7 +141,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "register_artifact",
-            "description": "Register a generated HTML, PDF, image, or other artifact for the canvas.",
+            "description": "Register a generated HTML, PDF, image, or other artifact for the canvas. "
+            "For a webapp, register the served HTML file (for example dashboard.html or site/index.html).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -250,7 +252,10 @@ def mock_executive_summary(messages: list[dict[str, Any]]) -> str:
 
 
 class LLMProvider(Protocol):
-    async def stream(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> AsyncIterator[str | dict[str, Any]]: ...
+    # Implementations are async generator functions, so a call returns the
+    # AsyncIterator directly; declaring `async def` here would type the call
+    # as a coroutine and mislead both checkers and future implementations.
+    def stream(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> AsyncIterator[str | dict[str, Any]]: ...
 
 
 class MockProvider:
@@ -291,14 +296,26 @@ class MockProvider:
 
 
 def dashboard_code() -> str:
+    # The canvas quality gate only publishes dashboards whose visible text
+    # carries concrete dataset values, so the mock computes real metrics from
+    # df_1 the way a competent model would.
     return """from pathlib import Path
 workspace = Path(WORKSPACE)
-html = '''<!doctype html><html><head><meta charset="utf-8"><title>Data Copilot Dashboard</title>
-<style>body{font-family:system-ui;margin:2rem;background:#f8fafc}main{max-width:900px;margin:auto}
-.card{background:white;border:1px solid #e2e8f0;border-radius:12px;padding:1.5rem;box-shadow:0 2px 8px #0001}
-h1{color:#0f172a}.metric{font-size:2rem;font-weight:700;color:#2563eb}</style></head>
+frame = globals().get("df_1")
+rows = len(frame) if frame is not None else 0
+cards = ""
+if frame is not None:
+    for name in frame.select_dtypes(include="number").columns[:4]:
+        value = frame[name].mean()
+        if value == value:  # skip NaN averages
+            cards += f'<p class="metric">{name}: {value:,.2f}</p>'
+html = f'''<!doctype html><html><head><meta charset="utf-8"><title>Data Copilot Dashboard</title>
+<style>body{{font-family:system-ui;margin:2rem;background:#f8fafc}}main{{max-width:900px;margin:auto}}
+.card{{background:white;border:1px solid #e2e8f0;border-radius:12px;padding:1.5rem;box-shadow:0 2px 8px #0001}}
+h1{{color:#0f172a}}.metric{{font-size:2rem;font-weight:700;color:#2563eb}}</style></head>
 <body><main><div class="card"><h1>Data Copilot Dashboard</h1>
-<p class="metric">Analysis complete</p><p>Interactive dashboard generated in the session sandbox.</p>
+<p class="metric">{rows:,} rows analyzed</p>{cards}
+<p>Interactive dashboard generated in the session sandbox.</p>
 </div></main></body></html>'''
 (workspace / "dashboard.html").write_text(html, encoding="utf-8")
 (workspace / "index.html").write_text(html, encoding="utf-8")
@@ -400,9 +417,12 @@ class AnthropicProvider:
             final = await stream.get_final_message()
         for block in final.content:
             if getattr(block, "type", None) == "tool_use":
+                # Only ToolUseBlock carries input; getattr keeps this safe across
+                # the SDK's growing union of content block types.
+                arguments = getattr(block, "input", {})
                 yield {
                     "tool": getattr(block, "name", ""),
-                    "arguments": block.input if isinstance(block.input, dict) else {},
+                    "arguments": arguments if isinstance(arguments, dict) else {},
                     "call_id": getattr(block, "id", ""),
                 }
 
@@ -598,7 +618,7 @@ class ToolDispatcher:
         self.trajectory_path.parent.mkdir(parents=True, exist_ok=True)
 
     def record(self, event: dict[str, Any]) -> None:
-        event = {"timestamp": datetime.now(timezone.utc).isoformat(), **event}
+        event = {"timestamp": datetime.now(UTC).isoformat(), **event}
         with self.trajectory_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, default=str) + "\n")
 
@@ -680,7 +700,22 @@ class ToolDispatcher:
         elif name == "register_artifact":
             artifacts = await self.sandbox.artifacts()
             requested = arguments.get("name")
+            requested = _workspace_relative(requested).rstrip("/") if requested else None
             selected = [a for a in artifacts if not requested or a.get("name") == requested]
+            if requested and not selected:
+                # Models sometimes register the directory they serve (for
+                # example attrition_dashboard/) instead of the HTML page inside
+                # it; resolve the directory to its served page so the canvas
+                # still receives the artifact.
+                prefix = requested + "/"
+                nested = [a for a in artifacts if str(a.get("path", "")).startswith(prefix)]
+                served = next((a for a in nested if a.get("name") == "index.html"), None)
+                if served is None:
+                    served = next(
+                        (a for a in nested if str(a.get("path", "")).lower().endswith(".html")),
+                        None,
+                    )
+                selected = [served] if served is not None else []
             for artifact in selected:
                 if arguments.get("port"):
                     artifact["port"] = int(arguments["port"])
@@ -717,7 +752,7 @@ class Agent:
     ):
         self.provider = provider
         self.dispatcher = ToolDispatcher(sandbox, session_id, Path(sessions_dir))
-        self.dataset_context = dataset_context or (lambda: [])
+        self.dataset_context = dataset_context or (list)
         # A caller can own the transcript (the gateway keeps it on the session) so
         # conversation memory survives a reconnect, which builds a new Agent.
         self.messages: list[dict[str, Any]] = history if history is not None else []
@@ -1033,7 +1068,7 @@ print("Fallback PDF written")
         profiles: list[dict[str, Any]],
     ) -> bool:
         """Require concrete profile values outside scripts and styles."""
-        visible = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", content, flags=re.I | re.S)
+        visible = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", content, flags=re.IGNORECASE | re.DOTALL)
         visible = re.sub(r"<[^>]+>", " ", visible)
         visible = html.unescape(visible).lower()
         if not visible.strip():
@@ -1183,9 +1218,20 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
             return None
         directory = _http_server_directory(command)
         if directory:
-            prefix = directory.rstrip("/\\") + "/"
-            if html_path.startswith(prefix):
-                return html_path[len(prefix):]
+            # html_path is usually workspace-relative while --directory often
+            # names the served root absolutely (for example
+            # --directory /workspace/attrition_dashboard); compare both in
+            # workspace-relative form so the preview path is relative to the
+            # server's document root instead of 404ing behind the proxy.
+            relative_dir = _workspace_relative(directory).strip("/\\")
+            normalized = _workspace_relative(html_path)
+            if relative_dir in {"", ".", "workspace"}:
+                # Serving the workspace root: the relative path already matches
+                # the server's document root.
+                return normalized
+            prefix = relative_dir + "/"
+            if normalized.startswith(prefix):
+                return normalized[len(prefix):]
         return html_path
 
     async def _dispatch(
@@ -1244,7 +1290,7 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
                         text_parts.append(item)
                         yield {"type": "assistant_delta", "content": item}
                         continue
-                    tool_id = f"tool-{datetime.now(timezone.utc).timestamp():.6f}"
+                    tool_id = f"tool-{datetime.now(UTC).timestamp():.6f}"
                     provider_call_id = str(item.get("call_id", tool_id))
                     arguments = item.get("arguments", {})
                     yield {
@@ -1323,9 +1369,7 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
                             if dashboard_request and report_request:
                                 if not (is_webapp or is_pdf):
                                     continue
-                            elif dashboard_request and not is_webapp:
-                                continue
-                            elif report_request and not is_pdf:
+                            elif dashboard_request and not is_webapp or report_request and not is_pdf:
                                 continue
                             artifact = dict(artifact)
                             if report_request and is_pdf:

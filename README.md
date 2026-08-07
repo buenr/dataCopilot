@@ -112,7 +112,7 @@ Requirements:
 Install dependencies and build the sandbox image:
 
 ```bash
-uv sync
+uv sync --all-extras
 cd frontend && npm install && cd ..
 cp .env.example .env
 docker build -t data-copilot-sandbox:latest sandbox
@@ -132,7 +132,7 @@ deterministic and requires no API key. Set `LLM_PROVIDER=anthropic` or
 `openai` and provide the corresponding key to use a live provider.
 
 Equivalent `make` targets are available: `make install`, `make backend`,
-`make frontend`, `make build-sandbox`, `make smoke`.
+`make frontend`, `make build-sandbox`, `make smoke`, `make e2e`.
 
 ## Demo
 
@@ -159,6 +159,23 @@ The live smoke test covers the same flow against the real Docker backend:
 ```bash
 uv run python scripts/smoke.py
 ```
+
+A Playwright suite verifies what a user actually experiences in the browser:
+dataset upload, the agent turn, the live dashboard and PDF in the canvas, and
+a browser refresh restoring the conversation and artifacts. It boots its own
+mock-provider backend and Vite server on ports 8100/5174, so it can run
+alongside a dev session, but it still executes every turn in a real Docker
+sandbox (requires the sandbox image and
+`npx playwright install chromium` once):
+
+```bash
+make e2e
+```
+
+`make e2e-live` adds a live-provider project that drives the same UI against
+the real OpenAI model — a PDF report first, then a dashboard — using
+`OPENAI_API_KEY` from `.env` on ports 8101/5175. It consumes API credits and
+takes several minutes per turn, so it is opt-in.
 
 ## Configuration
 
@@ -231,3 +248,25 @@ docker build -t data-copilot-sandbox:latest sandbox
 Backend tests run against `FakeSandbox` and require no Docker daemon. The
 smoke test exercises the real Docker-backed session: upload and profiling,
 dashboard preview, PDF download, and cleanup.
+
+`make lint` runs the same static gates as CI: ruff (lint), ty (types, scoped
+to `backend`/`scripts`), bandit (medium severity and up on `backend/app` and
+`scripts`), and semgrep (`p/python` + `p/security-audit`, needs network for
+the registry rulesets). By-design findings — the sandbox executing agent code,
+the gateway binding all interfaces — carry inline `# noqa` / `# nosec` /
+`# nosemgrep` justifications instead of blanket rule disables.
+
+## CI
+
+`.github/workflows/ci.yml` runs on every pull request and push to `main`/`develop`:
+
+- **python** — ruff, ty, bandit, and pytest via `uv sync --locked --all-extras`
+- **frontend** — `npm ci`, typecheck, and production build
+- **security** — semgrep plus a full-history gitleaks secret scan
+- **actionlint** — lints the workflow files themselves
+- **e2e** — the Playwright suite against real Docker sandboxes with the mock
+  provider (no LLM calls); manual only via the Actions tab, too slow for PR
+  gating
+
+Third-party actions and images are pinned by commit SHA or digest. Merging to
+`main` requires the four fast checks to pass (branch protection).

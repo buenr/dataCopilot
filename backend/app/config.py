@@ -8,7 +8,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     app_env: str = "development"
-    backend_host: str = "0.0.0.0"
+    # The gateway serves the local workbench and sandbox previews; binding all
+    # interfaces lets WSL/Docker hosts reach it.
+    backend_host: str = "0.0.0.0"  # nosec B104
     backend_port: int = 8000
     frontend_origin: str = "http://localhost:5173,http://127.0.0.1:5173"
     session_ttl_minutes: int = 30

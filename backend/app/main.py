@@ -6,21 +6,29 @@ import asyncio
 import json
 import mimetypes
 from contextlib import asynccontextmanager, suppress
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI,
+    File,
+    HTTPException,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from .agent import Agent, AnthropicProvider, MockProvider, OpenAIProvider
 from .config import Settings, get_settings
-from .profiling import SUPPORTED_SUFFIXES, profile_files
-from .proxy import parse_preview_path, preview_target
+from .profiling import profile_files
+from .proxy import preview_target
 from .sandbox import SessionManager
 
 
@@ -105,7 +113,7 @@ def safe_dataset_name(name: str) -> str:
 
 
 def _now_ms() -> int:
-    return int(datetime.now(timezone.utc).timestamp() * 1000)
+    return int(datetime.now(UTC).timestamp() * 1000)
 
 
 async def _preview_file_fallback(session: Any, path: str) -> Response | None:
@@ -230,7 +238,7 @@ async def reap_loop(manager: SessionManager, stop: asyncio.Event) -> None:
     while not stop.is_set():
         try:
             await asyncio.wait_for(stop.wait(), timeout=60)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             await manager.reap()
 
 
@@ -254,7 +262,9 @@ def create_app(settings: Settings | None = None, manager: SessionManager | None 
     origins = cors_origins(settings)
     application.add_middleware(
         CORSMiddleware,
-        allow_origins=origins or ["*"],
+        # An empty FRONTEND_ORIGIN is a misconfiguration, not a request to open the
+        # gateway to any site, so fall back to loopback rather than a wildcard.
+        allow_origins=origins or ["http://localhost:5173", "http://127.0.0.1:5173"],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -498,12 +508,10 @@ def create_app(settings: Settings | None = None, manager: SessionManager | None 
                 if payload.get("type") in {"cancel", "stop"}:
                     if turn is not None and not turn.done():
                         turn.cancel()
-                        try:
-                            # Aborting the HTTP call leaves the kernel busy, so the
-                            # cell itself has to be interrupted as well.
+                        # Aborting the HTTP call leaves the kernel busy, so the
+                        # cell itself has to be interrupted as well.
+                        with suppress(Exception):
                             await session.sandbox.interrupt()
-                        except Exception:
-                            pass
                         with suppress(asyncio.CancelledError):
                             await turn
                     await send({"type": "cancelled", "message": "Run stopped."})
