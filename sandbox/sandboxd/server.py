@@ -11,12 +11,13 @@ import socket
 import subprocess
 import time
 import uuid
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 WORKSPACE = Path(os.environ.get("SANDBOX_WORKSPACE", "/workspace")).resolve()
@@ -60,7 +61,13 @@ class Kernel:
         # Make the workspace explicit and available to all agent code.
         self.client.execute(f"from pathlib import Path\nWORKSPACE = Path({str(WORKSPACE)!r})")
 
-    async def execute(self, code: str) -> dict[str, Any]:
+    async def stream(self, code: str) -> AsyncIterator[dict[str, Any]]:
+        """Execute code and yield IOPub events as the kernel produces them.
+
+        The last event is always ``{"type": "summary", "result": {...}}`` carrying
+        the aggregate payload, so a caller can render live output and still end up
+        with the same result the buffered ``execute`` returns.
+        """
         async with self.lock:
             if not self.client:
                 output, errors = io.StringIO(), io.StringIO()
@@ -69,7 +76,21 @@ class Kernel:
                         exec(code, self.fallback_globals, self.fallback_globals)
                 except Exception as exc:
                     errors.write(f"{type(exc).__name__}: {exc}")
-                return {"stdout": output.getvalue(), "stderr": errors.getvalue(), "result": None, "events": []}
+                events = []
+                for name, text in (("stdout", output.getvalue()), ("stderr", errors.getvalue())):
+                    if text:
+                        events.append({"type": name, "data": text})
+                        yield events[-1]
+                yield {
+                    "type": "summary",
+                    "result": {
+                        "stdout": output.getvalue(),
+                        "stderr": errors.getvalue(),
+                        "result": None,
+                        "events": events,
+                    },
+                }
+                return
             msg_id = self.client.execute(code, allow_stdin=False)
             stdout, stderr, events = [], [], []
             while True:
@@ -78,20 +99,47 @@ class Kernel:
                     continue
                 content = message["content"]
                 kind = message["msg_type"]
+                event: dict[str, Any] | None = None
                 if kind == "stream":
                     (stdout if content["name"] == "stdout" else stderr).append(content["text"])
-                    events.append({"type": content["name"], "data": content["text"]})
+                    event = {"type": content["name"], "data": content["text"]}
                 elif kind == "error":
                     stderr.append("\n".join(content.get("traceback", [])))
-                    events.append({"type": "stderr", "data": stderr[-1]})
+                    event = {"type": "stderr", "data": stderr[-1]}
                 elif kind in {"execute_result", "display_data"}:
                     data = content.get("data", {})
                     text = data.get("text/plain", "")
                     if text:
-                        events.append({"type": "result", "data": text})
+                        event = {"type": "result", "data": text}
                 elif kind == "status" and content.get("execution_state") == "idle":
                     break
-            return {"stdout": "".join(stdout), "stderr": "".join(stderr), "result": None, "events": events}
+                if event is not None:
+                    events.append(event)
+                    yield event
+            yield {
+                "type": "summary",
+                "result": {
+                    "stdout": "".join(stdout),
+                    "stderr": "".join(stderr),
+                    "result": None,
+                    "events": events,
+                },
+            }
+
+    async def execute(self, code: str) -> dict[str, Any]:
+        payload: dict[str, Any] = {"stdout": "", "stderr": "", "result": None, "events": []}
+        async for event in self.stream(code):
+            if event.get("type") == "summary":
+                payload = event["result"]
+        return payload
+
+    async def interrupt(self) -> bool:
+        """Interrupt the running cell. Must not take the lock: the execution that
+        needs interrupting is holding it."""
+        if self.manager is None:
+            return False
+        await asyncio.to_thread(self.manager.interrupt_kernel)
+        return True
 
     def close(self) -> None:
         if self.client:
@@ -150,15 +198,49 @@ async def execute(request: ExecRequest) -> dict[str, Any]:
     return await kernel.execute(request.code)
 
 
+@app.post("/exec/stream")
+async def execute_stream(request: ExecRequest) -> StreamingResponse:
+    """Newline-delimited JSON so the gateway can forward output while code runs."""
+
+    async def body() -> AsyncIterator[bytes]:
+        async for event in kernel.stream(request.code):
+            yield (json.dumps(event, default=str) + "\n").encode()
+
+    return StreamingResponse(body(), media_type="application/x-ndjson")
+
+
+@app.post("/interrupt")
+async def interrupt() -> dict[str, Any]:
+    return {"interrupted": await kernel.interrupt()}
+
+
 @app.get("/vars")
 async def variables() -> dict[str, Any]:
     # Querying through the kernel keeps state persistent and avoids exposing object data.
-    result = await kernel.execute("print(sorted(k for k in globals() if not k.startswith('_')))")
+    # Modules and callables are noise for the inspector; reprs are truncated so
+    # large frames do not flood the response.
+    snippet = (
+        "import json as _json, types as _types\n"
+        "_vars = []\n"
+        "for _name in sorted(globals()):\n"
+        "    if _name.startswith('_'):\n"
+        "        continue\n"
+        "    _value = globals()[_name]\n"
+        "    if isinstance(_value, _types.ModuleType) or callable(_value):\n"
+        "        continue\n"
+        "    try:\n"
+        "        _rendered = repr(_value)\n"
+        "    except Exception:\n"
+        "        _rendered = '<unrepresentable>'\n"
+        "    _vars.append({'name': _name, 'type': type(_value).__name__, 'value': _rendered[:120]})\n"
+        "print(_json.dumps(_vars))\n"
+    )
+    result = await kernel.execute(snippet)
     try:
-        names = json.loads(result["stdout"].strip().replace("'", '"'))
+        variables = json.loads(result["stdout"].strip())
     except (json.JSONDecodeError, AttributeError):
-        names = []
-    return {"vars": names}
+        variables = []
+    return {"vars": variables}
 
 
 @app.post("/files")
@@ -184,6 +266,18 @@ async def list_files(path: str = ".") -> dict[str, Any]:
         if item.is_file()
     ]
     return {"files": files}
+
+
+@app.delete("/files/{path:path}")
+async def remove_file(path: str) -> dict[str, Any]:
+    try:
+        target = safe_workspace_path(path, allow_missing=False)
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(404, str(exc)) from exc
+    if not target.is_file():
+        raise HTTPException(404, "not a file")
+    target.unlink()
+    return {"deleted": str(target.relative_to(WORKSPACE))}
 
 
 @app.get("/files/{path:path}")

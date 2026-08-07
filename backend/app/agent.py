@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import re
@@ -11,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Protocol
 
-from .sandbox import Execution, Sandbox
+from .sandbox import EventCallback, Execution, Sandbox
 
 TOOLS = {"run_python", "write_file", "read_file", "list_files", "start_webapp", "stop_webapp", "register_artifact"}
 PROVIDER_WORKSPACE = "/home/oai/share"
@@ -587,12 +588,17 @@ class ToolDispatcher:
             index += 1
         return shlex.join(normalized)
 
-    async def dispatch(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    async def dispatch(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        on_event: EventCallback | None = None,
+    ) -> dict[str, Any]:
         if name not in TOOLS:
             raise ValueError(f"unknown tool: {name}")
         self.record({"type": "tool_start", "tool": name, "arguments": {k: v for k, v in arguments.items() if k != "content"}})
         if name == "run_python":
-            execution = await self._run_with_retries(str(arguments.get("code", "")))
+            execution = await self._run_with_retries(str(arguments.get("code", "")), on_event)
             result = {
                 "stdout": execution.stdout,
                 "stderr": execution.stderr,
@@ -630,8 +636,8 @@ class ToolDispatcher:
         self.record({"type": "tool_result", "tool": name, "result": result})
         return result
 
-    async def _run_with_retries(self, code: str) -> Execution:
-        execution = await self.sandbox.exec(code)
+    async def _run_with_retries(self, code: str, on_event: EventCallback | None = None) -> Execution:
+        execution = await self.sandbox.exec(code, on_event)
         retries = 0
         # Retry only a bare failure (stderr with no stdout and no result), the
         # signature of a transient kernel error. Code that already produced
@@ -639,7 +645,7 @@ class ToolDispatcher:
         # and re-running would duplicate side effects such as file writes.
         while execution.stderr and not execution.stdout and execution.result is None and retries < 3:
             retries += 1
-            execution = await self.sandbox.exec(code)
+            execution = await self.sandbox.exec(code, on_event)
         return execution
 
 
@@ -651,11 +657,14 @@ class Agent:
         session_id: str,
         sessions_dir: str | Path = "sessions",
         dataset_context: Callable[[], list[dict[str, Any]]] | None = None,
+        history: list[dict[str, Any]] | None = None,
     ):
         self.provider = provider
         self.dispatcher = ToolDispatcher(sandbox, session_id, Path(sessions_dir))
         self.dataset_context = dataset_context or (lambda: [])
-        self.messages: list[dict[str, Any]] = []
+        # A caller can own the transcript (the gateway keeps it on the session) so
+        # conversation memory survives a reconnect, which builds a new Agent.
+        self.messages: list[dict[str, Any]] = history if history is not None else []
 
     @staticmethod
     def _is_dashboard_request(content: str) -> bool:
@@ -1039,6 +1048,33 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
                 return html_path[len(prefix):]
         return html_path
 
+    async def _dispatch(
+        self, name: str, arguments: dict[str, Any]
+    ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
+        """Dispatch a tool, forwarding kernel output while the code is still running.
+
+        Yields ``("event", output_event)`` zero or more times and always ends with
+        ``("result", tool_result)``. The sandbox reports output through a callback,
+        so a queue is what lets an async generator re-emit it as it arrives.
+        """
+        if name != "run_python":
+            yield "result", await self.dispatcher.dispatch(name, arguments)
+            return
+        queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+        task = asyncio.create_task(self.dispatcher.dispatch(name, arguments, queue.put_nowait))
+        task.add_done_callback(lambda _: queue.put_nowait(None))
+        try:
+            while True:
+                event = await queue.get()
+                if event is None:
+                    break
+                yield "event", event
+            yield "result", await task
+        finally:
+            # A cancelled turn (user pressed stop) must not leave the dispatch running.
+            if not task.done():
+                task.cancel()
+
     async def turn(self, content: str) -> AsyncIterator[dict[str, Any]]:
         self.messages.append({"role": "user", "content": content})
         self.dispatcher.record({"type": "user_message", "content": content})
@@ -1070,11 +1106,45 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
                         "tool": item["tool"],
                         "input": arguments,
                     }
-                    tool_result = await self.dispatcher.dispatch(item["tool"], arguments)
+                    streamed = False
+                    if item["tool"] == "run_python":
+                        # Publish the code before it runs so the inspector is not
+                        # empty for the duration of the execution.
+                        yield {
+                            "type": "execution",
+                            "status": "running",
+                            "code": str(arguments.get("code", "")),
+                        }
+                    tool_result: dict[str, Any] = {}
+                    async for kind, chunk in self._dispatch(item["tool"], arguments):
+                        if kind == "result":
+                            tool_result = chunk
+                            continue
+                        data = chunk.get("data")
+                        if not isinstance(data, str) or not data:
+                            continue
+                        streamed = True
+                        yield {
+                            "type": "execution",
+                            "status": "running",
+                            "stream": str(chunk.get("type") or "stdout"),
+                            "data": data,
+                        }
                     tool_calls.append((provider_call_id, item["tool"], arguments, tool_result))
                     yield {"type": "tool_result", "id": tool_id, "tool": item["tool"], **tool_result}
                     if item["tool"] == "run_python":
-                        yield {"type": "execution", "status": "complete", **tool_result}
+                        try:
+                            variables = await self.dispatcher.sandbox.vars()
+                        except Exception:
+                            # Variable inspection is best-effort and must never break a turn.
+                            variables = []
+                        completed = dict(tool_result)
+                        if streamed:
+                            # Output already reached the client incrementally; resending
+                            # the aggregate would duplicate it.
+                            completed.pop("stdout", None)
+                            completed.pop("stderr", None)
+                        yield {"type": "execution", "status": "complete", "variables": variables, **completed}
                     if item["tool"] == "start_webapp":
                         normalized_command = ToolDispatcher._normalize_webapp_command(
                             str(arguments.get("command", ""))

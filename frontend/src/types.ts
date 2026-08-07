@@ -16,6 +16,7 @@ export type Dataset = {
   size?: string;
   variable?: string;
   schema: DatasetColumn[];
+  sampleRows?: Array<Record<string, unknown>>;
 };
 
 export type ChatMessage = {

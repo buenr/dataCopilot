@@ -101,10 +101,39 @@ async def test_agent_returns_tool_results_to_provider_once(tmp_path: Path):
     events = [event async for event in agent.turn("Calculate the average revenue")]
 
     assert provider.calls == 2
-    assert any(event["type"] == "execution" and "1190.0" in event["stdout"] for event in events)
+    assert any(
+        event["type"] == "execution" and event.get("status") == "running" and "1190.0" in event.get("data", "")
+        for event in events
+    )
     assert any(event["type"] == "assistant_message" and "1190.0" in event["content"] for event in events)
     trajectory = (tmp_path / "sessions" / "loop" / "trajectory.jsonl").read_text()
     assert trajectory.count('"type": "tool_start"') == 1
+
+
+class SetVariableProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def stream(self, messages, tools):
+        self.calls += 1
+        if self.calls == 1:
+            yield {"tool": "run_python", "call_id": "call-1", "arguments": {"code": "answer = 41"}}
+        else:
+            yield "Done."
+
+
+@pytest.mark.asyncio
+async def test_execution_event_includes_kernel_variables(tmp_path: Path):
+    sandbox = FakeSandbox("vars", tmp_path / "workspace")
+    agent = Agent(sandbox, SetVariableProvider(), "vars", tmp_path / "sessions")
+
+    events = [event async for event in agent.turn("Set a variable")]
+
+    execution = next(event for event in events if event["type"] == "execution" and event.get("status") == "complete")
+    variables = {variable["name"]: variable for variable in execution["variables"]}
+    assert variables["answer"]["type"] == "int"
+    assert variables["answer"]["value"] == "41"
+    assert all(not name.startswith("_") for name in variables)
 
 
 class DashboardSourceOnlyProvider:
@@ -590,3 +619,42 @@ async def test_run_with_retries_still_retries_bare_failures(tmp_path: Path):
 
     assert "RuntimeError" in execution.stderr
     assert (sandbox.root / "attempts.txt").read_text() == "xxxx"  # initial run + 3 retries
+
+
+class PrintAndSetProvider:
+    """One round: run_python that prints and sets a variable, then wrap-up text."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def stream(self, messages, tools):
+        self.calls += 1
+        if self.calls == 1:
+            yield {"tool": "run_python", "call_id": "call-1", "arguments": {"code": "answer = 42\nprint(answer)"}}
+        else:
+            yield "Done."
+
+
+@pytest.mark.asyncio
+async def test_streaming_events_emit_code_then_deltas_then_complete_without_stdout(tmp_path: Path):
+    sandbox = FakeSandbox("stream-order", tmp_path / "workspace")
+    agent = Agent(sandbox, PrintAndSetProvider(), "stream-order", tmp_path / "sessions")
+
+    events = [event async for event in agent.turn("Compute and print")]
+    exec_events = [event for event in events if event["type"] == "execution"]
+
+    # 1. An initial "running" event publishes the code before the cell runs.
+    assert exec_events[0]["status"] == "running"
+    assert "answer = 42" in exec_events[0].get("code", "")
+
+    # 2. Streaming deltas carry the printed output.
+    deltas = [event for event in exec_events if event.get("stream") and event.get("data")]
+    assert len(deltas) >= 1
+    assert any("42" in event["data"] for event in deltas)
+
+    # 3. The "complete" event carries variables but not the already-streamed stdout.
+    complete = next(event for event in exec_events if event.get("status") == "complete")
+    assert "variables" in complete
+    assert any(v["name"] == "answer" for v in complete["variables"])
+    assert "stdout" not in complete
+    assert "stderr" not in complete

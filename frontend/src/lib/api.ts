@@ -29,13 +29,32 @@ export async function createSession() {
   return String(id);
 }
 
-export async function uploadDataset(sessionId: string, file: File) {
+export async function getSession(sessionId: string) {
+  const response = await fetch(apiUrl(`/api/sessions/${sessionId}`));
+  return response;
+}
+
+export async function deleteSession(sessionId: string) {
+  try {
+    await fetch(apiUrl(`/api/sessions/${sessionId}`), { method: 'DELETE' });
+  } catch {
+    // Best-effort: a dropped gateway or already-reaped session is not fatal.
+  }
+}
+
+export async function uploadDataset(sessionId: string, files: File[]) {
   const form = new FormData();
-  form.append('files', file);
+  for (const file of files) form.append('files', file);
   const response = await fetch(apiUrl(`/api/sessions/${sessionId}/files`), {
     method: 'POST',
     body: form,
   });
   if (!response.ok) throw new Error(`Upload failed (${response.status})`);
+  return (await response.json().catch(() => ({}))) as Record<string, unknown>;
+}
+
+export async function deleteDataset(sessionId: string, name: string) {
+  const response = await fetch(apiUrl(`/api/sessions/${sessionId}/files/${encodeURIComponent(name)}`), { method: 'DELETE' });
+  if (!response.ok) throw new Error(`Dataset removal failed (${response.status})`);
   return (await response.json().catch(() => ({}))) as Record<string, unknown>;
 }
