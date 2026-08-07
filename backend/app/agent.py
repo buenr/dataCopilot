@@ -25,14 +25,17 @@ def _workspace_relative(path: Any) -> str:
         return text[len("/workspace/"):]
     return text
 # Tool-call rounds allowed per turn, for every request. Sixteen gives slower
-# providers room to explore and still author the artifact; two rounds before
+# providers room to explore and still author the artifact; a few rounds before
 # the cap a wrap-up nudge is folded into the running history so the model
-# spends its last steps writing instead of exploring.
+# spends its last steps writing instead of exploring. Four remaining rounds
+# leaves enough budget to write, register, and summarize an artifact.
 MAX_TURN_STEPS = 16
+WRAP_UP_REMAINING_STEPS = 4
 WRAP_UP_NUDGE = (
-    "Step budget nearly exhausted: only 2 tool rounds remain. Stop exploring "
-    "and finish with what you have: write the requested artifact to the "
-    "workspace, call register_artifact, then summarize your findings."
+    f"Step budget nearly exhausted: only {WRAP_UP_REMAINING_STEPS} tool "
+    "rounds remain. Stop exploring and finish with what you have: write the "
+    "requested artifact to the workspace, call register_artifact, then "
+    "summarize your findings."
 )
 
 # The kernel preloads WORKSPACE for convenience, but agent code can reassign it,
@@ -1022,7 +1025,10 @@ class Agent:
             # message would break Anthropic's role alternation.
             steps_exhausted = True
             for step in range(MAX_TURN_STEPS):
-                if step == MAX_TURN_STEPS - 2 and request_messages[-1].get("role") == "tool":
+                if (
+                    step == MAX_TURN_STEPS - WRAP_UP_REMAINING_STEPS
+                    and request_messages[-1].get("role") == "tool"
+                ):
                     request_messages[-1]["content"] += "\n\n" + WRAP_UP_NUDGE
                     self.dispatcher.record({"type": "wrap_up_nudge", "step": step + 1})
                 text_parts: list[str] = []

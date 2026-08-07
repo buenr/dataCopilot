@@ -7,6 +7,7 @@ from app.agent import (
     MAX_TURN_STEPS,
     PDF_RESCUE_CODE,
     WRAP_UP_NUDGE,
+    WRAP_UP_REMAINING_STEPS,
     Agent,
     AnthropicProvider,
     MockProvider,
@@ -1045,7 +1046,7 @@ async def test_turn_stops_after_sixteen_rounds_and_says_so(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_wrap_up_nudge_reaches_the_provider_two_rounds_before_the_cap(tmp_path: Path):
+async def test_wrap_up_nudge_reaches_the_provider_before_the_cap(tmp_path: Path):
     provider = EndlessExplorerProvider()
     sandbox = FakeSandbox("nudge", tmp_path / "workspace")
     agent = Agent(sandbox, provider, "nudge", tmp_path / "sessions")
@@ -1055,8 +1056,9 @@ async def test_wrap_up_nudge_reaches_the_provider_two_rounds_before_the_cap(tmp_
     finally:
         await sandbox.close()
 
-    before = provider.requests[: MAX_TURN_STEPS - 2]
-    nudged = provider.requests[MAX_TURN_STEPS - 2]
+    assert f"only {WRAP_UP_REMAINING_STEPS} tool rounds remain" in WRAP_UP_NUDGE
+    before = provider.requests[: MAX_TURN_STEPS - WRAP_UP_REMAINING_STEPS]
+    nudged = provider.requests[MAX_TURN_STEPS - WRAP_UP_REMAINING_STEPS]
     assert not any(WRAP_UP_NUDGE in str(message) for call in before for message in call)
     assert any(
         message.get("role") == "tool" and WRAP_UP_NUDGE in str(message.get("content", ""))
