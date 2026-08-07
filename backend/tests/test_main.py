@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 
 import httpx
@@ -280,6 +281,119 @@ def test_session_resume_replays_transcript(tmp_path: Path):
             assert any(m["role"] == "assistant" for m in messages)
 
 
+def test_session_resume_replays_artifacts(tmp_path: Path):
+    from fastapi.testclient import TestClient
+
+    settings = Settings(sessions_dir=str(tmp_path / "sessions"), llm_provider="mock")
+    manager = SessionManager(
+        settings,
+        sandbox_factory=lambda sid: FakeSandbox(sid, tmp_path / "workspaces" / sid),
+    )
+    application = create_app(settings, manager)
+
+    with TestClient(application) as client:
+        session_id = client.post("/api/sessions").json()["id"]
+        # A generated dashboard exists in the sandbox workspace.
+        (tmp_path / "workspaces" / session_id / "dashboard.html").write_text("<!doctype html>")
+        # A reconnecting browser gets the artifact list in session_ready, so a
+        # refresh does not empty the canvas.
+        with client.websocket_connect(f"/ws/sessions/{session_id}") as socket:
+            ready = socket.receive_json()
+            assert ready["type"] == "session_ready"
+            assert any(a["name"] == "dashboard.html" for a in ready["artifacts"])
+
+
+def test_session_resume_restores_registered_artifact_metadata(tmp_path: Path):
+    from fastapi.testclient import TestClient
+
+    settings = Settings(sessions_dir=str(tmp_path / "sessions"), llm_provider="mock")
+    manager = SessionManager(
+        settings,
+        sandbox_factory=lambda sid: FakeSandbox(sid, tmp_path / "workspaces" / sid),
+    )
+    application = create_app(settings, manager)
+
+    with TestClient(application) as client:
+        session_id = client.post("/api/sessions").json()["id"]
+        workspace = tmp_path / "workspaces" / session_id
+        workspace.mkdir(parents=True, exist_ok=True)
+        (workspace / "dashboard.html").write_text("<!doctype html>")
+        (workspace / "report.pdf").write_bytes(b"%PDF-1.4 fake")
+        (workspace / "chart.png").write_bytes(b"\x89PNG fake")
+        (workspace / "recovered.html").write_text("<!doctype html>")
+        # The sandbox scan reports name/path/size only; the trajectory remembers
+        # the type and port the model declared for each artifact.
+        trajectory = tmp_path / "sessions" / session_id / "trajectory.jsonl"
+        trajectory.parent.mkdir(parents=True, exist_ok=True)
+        trajectory.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "tool_result",
+                            "tool": "register_artifact",
+                            "result": {
+                                "artifacts": [
+                                    {
+                                        "name": "dashboard.html",
+                                        "path": "dashboard.html",
+                                        "size": 15,
+                                        "port": 8501,
+                                        "type": "webapp",
+                                    }
+                                ]
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "tool_result",
+                            "tool": "register_artifact",
+                            "result": {
+                                "artifacts": [
+                                    {
+                                        "name": "report.pdf",
+                                        "path": "report.pdf",
+                                        "size": 12,
+                                        "type": "pdf",
+                                    }
+                                ]
+                            },
+                        }
+                    ),
+                    # The dashboard recovery path records its own event rather
+                    # than a register_artifact tool result.
+                    json.dumps(
+                        {
+                            "type": "artifact_recovered",
+                            "artifact": {
+                                "name": "recovered.html",
+                                "path": "recovered.html",
+                                "port": 8502,
+                                "type": "webapp",
+                            },
+                        }
+                    ),
+                ]
+            )
+            + "\n"
+        )
+
+        with client.websocket_connect(f"/ws/sessions/{session_id}") as socket:
+            ready = socket.receive_json()
+            artifacts = {a["name"]: a for a in ready["artifacts"]}
+            assert artifacts["dashboard.html"]["type"] == "webapp"
+            assert artifacts["dashboard.html"]["port"] == 8501
+            assert artifacts["report.pdf"]["type"] == "pdf"
+            assert artifacts["recovered.html"]["type"] == "webapp"
+            assert artifacts["recovered.html"]["port"] == 8502
+            # An unregistered scan hit still lands on a sensible tab.
+            assert artifacts["chart.png"]["type"] == "image"
+            # Registered artifacts replay last so the canvas re-selects the
+            # artifact the user was looking at.
+            assert ready["artifacts"][-1]["name"] == "recovered.html"
+
+
 @pytest.mark.asyncio
 async def test_dataset_delete_renumbers_remaining_frames(tmp_path: Path):
     settings = Settings(sessions_dir=str(tmp_path / "sessions"))
@@ -335,56 +449,3 @@ async def test_delete_missing_dataset_returns_404(tmp_path: Path):
         assert response.status_code == 404
 
 
-@pytest.mark.asyncio
-async def test_sample_data_endpoint_loads_bundled_datasets(tmp_path: Path):
-    sample_dir = tmp_path / "sample_data"
-    sample_dir.mkdir()
-    (sample_dir / "people.csv").write_text("name,score\nAda,10\nGrace,20\n")
-    settings = Settings(
-        sessions_dir=str(tmp_path / "sessions"),
-        sample_data_dir=str(sample_dir),
-    )
-    manager = SessionManager(
-        settings,
-        sandbox_factory=lambda sid: FakeSandbox(sid, tmp_path / "workspaces" / sid),
-    )
-    application = create_app(settings, manager)
-
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=application),
-        base_url="http://test",
-    ) as client:
-        created = await client.post("/api/sessions")
-        session_id = created.json()["id"]
-        response = await client.post(f"/api/sessions/{session_id}/sample-data")
-
-    assert response.status_code == 200
-    schema = response.json()["schemas"][0]
-    assert schema["file"] == "people.csv"
-    assert schema["rows"] == 2
-    session = manager.get(session_id)
-    execution = await session.sandbox.exec("print(df_1['score'].sum())")
-    assert execution.stdout.strip() == "30"
-
-
-@pytest.mark.asyncio
-async def test_sample_data_endpoint_404_when_nothing_bundled(tmp_path: Path):
-    settings = Settings(
-        sessions_dir=str(tmp_path / "sessions"),
-        sample_data_dir=str(tmp_path / "missing-sample-data"),
-    )
-    manager = SessionManager(
-        settings,
-        sandbox_factory=lambda sid: FakeSandbox(sid, tmp_path / "workspaces" / sid),
-    )
-    application = create_app(settings, manager)
-
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=application),
-        base_url="http://test",
-    ) as client:
-        created = await client.post("/api/sessions")
-        session_id = created.json()["id"]
-        response = await client.post(f"/api/sessions/{session_id}/sample-data")
-
-    assert response.status_code == 404

@@ -16,6 +16,14 @@ from .sandbox import EventCallback, Execution, Sandbox
 
 TOOLS = {"run_python", "write_file", "read_file", "list_files", "start_webapp", "stop_webapp", "register_artifact"}
 PROVIDER_WORKSPACE = "/home/oai/share"
+
+
+def _workspace_relative(path: Any) -> str:
+    """Models sometimes pass kernel-absolute paths; the sandbox file API is workspace-relative."""
+    text = str(path)
+    if text.startswith("/workspace/"):
+        return text[len("/workspace/"):]
+    return text
 # The kernel preloads WORKSPACE for convenience, but agent code can reassign it,
 # so this snippet resolves the real workspace from the sandbox environment. A
 # wrong destination would silently copy a rescued PDF back onto itself.
@@ -552,6 +560,8 @@ class OpenAIProvider:
             "model": self.model,
             "input": input_items,
             "stream": True,
+            # Always run reasoning models at maximum effort.
+            "reasoning": {"effort": "max"},
         }
         if system:
             request["instructions"] = system
@@ -650,13 +660,15 @@ class ToolDispatcher:
                 "code": str(arguments.get("code", "")),
             }
         elif name == "write_file":
-            await self.sandbox.upload(str(arguments["path"]), str(arguments.get("content", "")).encode())
-            result = {"path": arguments["path"]}
+            path = _workspace_relative(arguments["path"])
+            await self.sandbox.upload(path, str(arguments.get("content", "")).encode())
+            result = {"path": path}
         elif name == "read_file":
-            data = await self.sandbox.read_file(str(arguments["path"]))
-            result = {"path": arguments["path"], "content": data.decode("utf-8", errors="replace")}
+            path = _workspace_relative(arguments["path"])
+            data = await self.sandbox.read_file(path)
+            result = {"path": path, "content": data.decode("utf-8", errors="replace")}
         elif name == "list_files":
-            path = str(arguments.get("path", "."))
+            path = _workspace_relative(arguments.get("path", "."))
             result = {"files": await self.sandbox.list_files("." if path == "/" else path)}
         elif name == "start_webapp":
             port = int(arguments.get("port", 8501))
@@ -1215,7 +1227,10 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
             final_text = ""
             dashboard_request = self._is_dashboard_request(content)
             report_request = self._is_report_request(content)
-            renderable_artifact = False
+            # Tracked per category so a combined dashboard+report turn gates each
+            # recovery path below on its own artifact kind.
+            published_pdf = False
+            published_webapp = False
             started_ports: dict[int, str] = {}
             all_text: list[str] = []
             run_python_outputs: list[str] = []
@@ -1248,20 +1263,26 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
                             "code": str(arguments.get("code", "")),
                         }
                     tool_result: dict[str, Any] = {}
-                    async for kind, chunk in self._dispatch(item["tool"], arguments):
-                        if kind == "result":
-                            tool_result = chunk
-                            continue
-                        data = chunk.get("data")
-                        if not isinstance(data, str) or not data:
-                            continue
-                        streamed = True
-                        yield {
-                            "type": "execution",
-                            "status": "running",
-                            "stream": str(chunk.get("type") or "stdout"),
-                            "data": data,
-                        }
+                    try:
+                        async for kind, chunk in self._dispatch(item["tool"], arguments):
+                            if kind == "result":
+                                tool_result = chunk
+                                continue
+                            data = chunk.get("data")
+                            if not isinstance(data, str) or not data:
+                                continue
+                            streamed = True
+                            yield {
+                                "type": "execution",
+                                "status": "running",
+                                "stream": str(chunk.get("type") or "stdout"),
+                                "data": data,
+                            }
+                    except Exception as exc:
+                        # A failing tool (e.g. read_file on a path sandboxd
+                        # rejects) must not kill the turn: hand the error back
+                        # to the model so it can recover.
+                        tool_result = {"error": str(exc)}
                     tool_calls.append((provider_call_id, item["tool"], arguments, tool_result))
                     yield {"type": "tool_result", "id": tool_id, "tool": item["tool"], **tool_result}
                     if item["tool"] == "run_python":
@@ -1280,44 +1301,43 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
                             completed.pop("stdout", None)
                             completed.pop("stderr", None)
                         yield {"type": "execution", "status": "complete", "variables": variables, **completed}
-                    if item["tool"] == "start_webapp":
+                    if item["tool"] == "start_webapp" and "port" in tool_result:
                         normalized_command = ToolDispatcher._normalize_webapp_command(
                             str(arguments.get("command", ""))
                         )
                         started_ports[int(tool_result["port"])] = str(
                             normalized_command
                         )
-                    if item["tool"] == "stop_webapp":
+                    if item["tool"] == "stop_webapp" and "port" in tool_result:
                         started_ports.pop(int(tool_result["port"]), None)
-                    if item["tool"] == "register_artifact":
+                    if item["tool"] == "register_artifact" and "artifacts" in tool_result:
                         artifacts = tool_result["artifacts"]
-                        if report_request:
-                            renderable_artifact = any(
-                                self._is_pdf_artifact(artifact)
-                                for artifact in artifacts
-                            ) or renderable_artifact
-                        elif not dashboard_request:
-                            renderable_artifact = bool(artifacts) or renderable_artifact
                         for artifact in artifacts:
-                            if dashboard_request and not (
+                            is_webapp = bool(
                                 artifact.get("type") == "webapp" and artifact.get("port")
-                            ):
+                            )
+                            is_pdf = self._is_pdf_artifact(artifact)
+                            # A turn can ask for a dashboard AND a report: match
+                            # each artifact to its own category rather than
+                            # requiring every artifact to satisfy both gates.
+                            if dashboard_request and report_request:
+                                if not (is_webapp or is_pdf):
+                                    continue
+                            elif dashboard_request and not is_webapp:
                                 continue
-                            if report_request and not (
-                                self._is_pdf_artifact(artifact)
-                            ):
+                            elif report_request and not is_pdf:
                                 continue
                             artifact = dict(artifact)
-                            if report_request:
+                            if report_request and is_pdf:
                                 artifact["type"] = "pdf"
                             artifact_source_path = artifact.get("path")
-                            if dashboard_request and artifact.get("path"):
+                            if dashboard_request and is_webapp and artifact.get("path"):
                                 command = started_ports.get(int(artifact["port"]), "")
                                 artifact["path"] = self._static_preview_path(
                                     str(artifact["path"]),
                                     command,
                                 )
-                            if dashboard_request and dataset_profiles:
+                            if dashboard_request and is_webapp and dataset_profiles:
                                 artifact_path = artifact_source_path
                                 if artifact_path:
                                     try:
@@ -1331,9 +1351,13 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
                                         ):
                                             continue
                                     except Exception:
-                                        continue
-                            if dashboard_request:
-                                renderable_artifact = True
+                                        # A read hiccup says nothing about the
+                                        # dashboard's content; still publish it.
+                                        pass
+                            if is_webapp:
+                                published_webapp = True
+                            if is_pdf:
+                                published_pdf = True
                             yield {
                                 "type": "artifact",
                                 "name": artifact.get("name"),
@@ -1372,7 +1396,7 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
                             "content": json.dumps(result, default=str),
                         }
                     )
-            if report_request and not renderable_artifact:
+            if report_request and not published_pdf:
                 fallback_content = "\n\n".join(all_text or run_python_outputs)
                 if not fallback_content:
                     # The provider hit the step cap without saying anything;
@@ -1402,7 +1426,7 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
                         f"canvas: {recovery_error}."
                     )
                     final_text = f"{final_text}\n\n{notice}" if final_text else notice
-            if dashboard_request and not renderable_artifact:
+            if dashboard_request and not published_webapp:
                 recovered, recovery_error = await self._recover_dashboard_artifact(
                     started_ports,
                     dataset_profiles,

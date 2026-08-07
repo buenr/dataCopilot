@@ -71,9 +71,3 @@ export async function deleteDataset(sessionId: string, name: string) {
   if (!response.ok) await throwWithDetail(response, 'Dataset removal failed');
   return (await response.json().catch(() => ({}))) as Record<string, unknown>;
 }
-
-export async function loadSampleData(sessionId: string) {
-  const response = await fetch(apiUrl(`/api/sessions/${sessionId}/sample-data`), { method: 'POST' });
-  if (!response.ok) await throwWithDetail(response, 'Could not load the sample data');
-  return (await response.json().catch(() => ({}))) as Record<string, unknown>;
-}

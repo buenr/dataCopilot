@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import {
   AlertCircle,
   ArrowUp,
@@ -23,7 +24,11 @@ import {
   LayoutPanelLeft,
   Maximize2,
   Minimize2,
+  PanelLeftClose,
+  PanelLeftOpen,
   PanelRight,
+  PanelRightClose,
+  PanelRightOpen,
   Paperclip,
   Play,
   Plus,
@@ -44,13 +49,12 @@ import {
   deleteDataset,
   deleteSession,
   getSession,
-  loadSampleData,
   uploadDataset,
   websocketUrl,
 } from './lib/api';
 import { useWorkbench } from './store/workbench';
 import type { WorkbenchState } from './store/workbench';
-import type { ChatMessage, Dataset, DatasetColumn, SessionEvent } from './types';
+import type { Artifact, ChatMessage, Dataset, DatasetColumn, SessionEvent } from './types';
 
 const suggestions = [
   { label: 'Explore my data', icon: Search },
@@ -63,6 +67,18 @@ const newId = (prefix: string) => `${prefix}-${Date.now()}-${Math.random().toStr
 
 function textValue(value: unknown, fallback = '') {
   return typeof value === 'string' ? value : fallback;
+}
+
+// Shared by the live artifact event and the session_ready replay.
+function toArtifact(incoming: Record<string, unknown>): Artifact {
+  return {
+    type: (incoming.type ?? incoming.kind ?? 'webapp') as Artifact['type'],
+    name: textValue(incoming.name),
+    title: textValue(incoming.title),
+    url: textValue(incoming.url),
+    path: textValue(incoming.path),
+    port: Number(incoming.port ?? 0) || undefined,
+  };
 }
 
 function fileIcon(kind: string) {
@@ -199,9 +215,10 @@ export default function App() {
   const [draft, setDraft] = useState('');
   const [sessionError, setSessionError] = useState('');
   const [uploading, setUploading] = useState(false);
-  const [sampleLoading, setSampleLoading] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [dragOver, setDragOver] = useState(false);
+  const [chatMinimized, setChatMinimized] = useState(false);
+  const [canvasMinimized, setCanvasMinimized] = useState(false);
   const [sessionKey, setSessionKey] = useState(0);
 
   const handleEvent = useCallback((event: SessionEvent) => {
@@ -230,6 +247,14 @@ export default function App() {
               profileToDataset(summary),
             ),
           );
+        }
+        const replayArtifacts = (event as Record<string, unknown>).artifacts;
+        if (Array.isArray(replayArtifacts)) {
+          // Without this a refresh would empty the canvas even though the
+          // sandbox still holds every generated dashboard and report.
+          for (const item of replayArtifacts as Array<Record<string, unknown>>) {
+            wb.setArtifact(toArtifact(item));
+          }
         }
         wb.clearTools();
         wb.updateExecution({ stdout: '', stderr: '', code: '', variables: [], running: false });
@@ -314,15 +339,7 @@ export default function App() {
         break;
       }
       case 'artifact': {
-        const incoming = (payload.artifact ?? payload) as Record<string, unknown>;
-        wb.setArtifact({
-          type: (incoming.type ?? incoming.kind ?? 'webapp') as 'webapp' | 'pdf' | 'document',
-          name: textValue(incoming.name),
-          title: textValue(incoming.title),
-          url: textValue(incoming.url),
-          path: textValue(incoming.path),
-          port: Number(incoming.port ?? 0) || undefined,
-        });
+        wb.setArtifact(toArtifact((payload.artifact ?? payload) as Record<string, unknown>));
         break;
       }
       case 'cancelled':
@@ -567,22 +584,6 @@ export default function App() {
     }
   };
 
-  const handleSampleData = async () => {
-    if (!sessionId || sampleLoading) return;
-    setSampleLoading(true);
-    try {
-      const response = await loadSampleData(sessionId);
-      const summaries = Array.isArray(response.schemas)
-        ? (response.schemas as Array<Record<string, unknown>>)
-        : [];
-      setDatasets(summaries.map((summary) => profileToDataset(summary)));
-    } catch (error) {
-      setSessionError(error instanceof Error ? error.message : 'Could not load the sample data.');
-    } finally {
-      setSampleLoading(false);
-    }
-  };
-
   const handleNewSession = async () => {
     if (
       (messages.length > 0 || datasets.length > 0) &&
@@ -630,7 +631,7 @@ export default function App() {
         )}
         {!canvasFullscreen && (
           <button
-            className="sidebar-toggle"
+            className={sidebarOpen ? 'sidebar-toggle' : 'sidebar-toggle closed'}
             onClick={() => setSidebarOpen(!sidebarOpen)}
             aria-label={sidebarOpen ? 'Hide data explorer' : 'Show data explorer'}
           >
@@ -638,46 +639,83 @@ export default function App() {
           </button>
         )}
         <PanelGroup direction="horizontal" className="main-panels">
-          {!canvasFullscreen && (
-            <>
-              <Panel defaultSize={35} minSize={28} maxSize={52} className="chat-panel">
-                <Chat
-                  messages={messages}
-                  tools={tools}
-                  draft={draft}
-                  datasets={datasets}
-                  onDraft={setDraft}
-                  onSend={() => sendMessage()}
-                  onSuggestion={sendMessage}
-                  onUpload={handleUpload}
-                  onSampleData={handleSampleData}
-                  sampleLoading={sampleLoading}
-                  inspectorOpen={inspectorOpen}
-                  onToggleInspector={() => setInspectorOpen(!inspectorOpen)}
-                  execution={execution}
-                  connected={connection === 'connected'}
-                  thinking={thinking}
-                  turnActive={turnActive}
-                  onStop={stopRun}
-                />
-              </Panel>
-              <PanelResizeHandle className="resize-handle">
-                <span />
-              </PanelResizeHandle>
-            </>
+          {!canvasFullscreen && !chatMinimized && (
+            <Panel
+              defaultSize={canvasMinimized ? 100 : 35}
+              minSize={28}
+              // As the only panel the chat must be allowed to fill the space.
+              maxSize={canvasMinimized ? 100 : 52}
+              className="chat-panel"
+            >
+              <Chat
+                messages={messages}
+                tools={tools}
+                draft={draft}
+                datasets={datasets}
+                onDraft={setDraft}
+                onSend={() => sendMessage()}
+                onSuggestion={sendMessage}
+                onUpload={handleUpload}
+                inspectorOpen={inspectorOpen}
+                onToggleInspector={() => setInspectorOpen(!inspectorOpen)}
+                execution={execution}
+                connected={connection === 'connected'}
+                thinking={thinking}
+                turnActive={turnActive}
+                onStop={stopRun}
+                onMinimize={() => {
+                  setChatMinimized(true);
+                  setCanvasMinimized(false);
+                }}
+              />
+            </Panel>
           )}
-          <Panel defaultSize={65} minSize={35} className="canvas-panel">
-            <Canvas
-              sessionId={sessionId}
-              artifact={artifact}
-              artifacts={artifacts}
-              tab={canvasTab}
-              onTab={setCanvasTab}
-              fullscreen={canvasFullscreen}
-              onFullscreen={() => setCanvasFullscreen(!canvasFullscreen)}
-              onSelectArtifact={selectArtifact}
-            />
-          </Panel>
+          {!canvasFullscreen && chatMinimized && (
+            <button
+              className="panel-strip"
+              onClick={() => setChatMinimized(false)}
+              aria-label="Expand chat panel"
+              title="Show chat"
+            >
+              <PanelLeftOpen size={15} />
+              <span>Chat</span>
+            </button>
+          )}
+          {!canvasFullscreen && !chatMinimized && !canvasMinimized && (
+            <PanelResizeHandle className="resize-handle">
+              <span />
+            </PanelResizeHandle>
+          )}
+          {!canvasMinimized && (
+            <Panel defaultSize={65} minSize={35} className="canvas-panel">
+              <Canvas
+                sessionId={sessionId}
+                artifact={artifact}
+                artifacts={artifacts}
+                tab={canvasTab}
+                onTab={setCanvasTab}
+                fullscreen={canvasFullscreen}
+                onFullscreen={() => setCanvasFullscreen(!canvasFullscreen)}
+                onSelectArtifact={selectArtifact}
+                onMinimize={() => {
+                  setCanvasMinimized(true);
+                  setChatMinimized(false);
+                  setCanvasFullscreen(false);
+                }}
+              />
+            </Panel>
+          )}
+          {canvasMinimized && (
+            <button
+              className="panel-strip right"
+              onClick={() => setCanvasMinimized(false)}
+              aria-label="Expand canvas panel"
+              title="Show canvas"
+            >
+              <span>Canvas</span>
+              <PanelRightOpen size={15} />
+            </button>
+          )}
         </PanelGroup>
       </main>
     </div>
@@ -949,8 +987,6 @@ function Chat({
   onSend,
   onSuggestion,
   onUpload,
-  onSampleData,
-  sampleLoading,
   inspectorOpen,
   onToggleInspector,
   execution,
@@ -958,6 +994,7 @@ function Chat({
   thinking,
   turnActive,
   onStop,
+  onMinimize,
   datasets,
 }: {
   messages: WorkbenchState['messages'];
@@ -967,8 +1004,6 @@ function Chat({
   onSend: () => void;
   onSuggestion: (value: string) => void;
   onUpload: (files: File[]) => void;
-  onSampleData: () => void;
-  sampleLoading: boolean;
   inspectorOpen: boolean;
   onToggleInspector: () => void;
   execution: WorkbenchState['execution'];
@@ -976,6 +1011,7 @@ function Chat({
   thinking: boolean;
   turnActive: boolean;
   onStop: () => void;
+  onMinimize: () => void;
   datasets: Dataset[];
 }) {
   const endRef = useRef<HTMLDivElement>(null);
@@ -999,14 +1035,20 @@ function Chat({
           <span className="eyebrow">Copilot</span>
           <h1>What will we uncover?</h1>
         </div>
+        <button
+          className="icon-button panel-minimize"
+          onClick={onMinimize}
+          aria-label="Minimize chat panel"
+          title="Minimize chat"
+        >
+          <PanelLeftClose size={15} />
+        </button>
       </div>
       <div className="chat-scroll">
         {messages.length === 0 && !thinking ? (
           <Welcome
             onSuggestion={onSuggestion}
             datasets={datasets}
-            onSampleData={onSampleData}
-            sampleLoading={sampleLoading}
           />
         ) : (
           <>
@@ -1090,13 +1132,9 @@ function Chat({
 function Welcome({
   onSuggestion,
   datasets,
-  onSampleData,
-  sampleLoading,
 }: {
   onSuggestion: (value: string) => void;
   datasets: Dataset[];
-  onSampleData: () => void;
-  sampleLoading: boolean;
 }) {
   // Suggestions reference the uploaded data once there is some, so a new user
   // sees prompts that actually apply to their file.
@@ -1109,19 +1147,6 @@ function Welcome({
       <div className="welcome-icon">
         <Sparkles size={25} />
       </div>
-      <span className="eyebrow">Your analytical partner</span>
-      <h2>
-        Start with a question.
-        <br />
-        <span>Leave with clarity.</span>
-      </h2>
-      <p>Upload a dataset and I’ll help you explore patterns, build visualizations, and turn findings into a polished deliverable.</p>
-      {datasets.length === 0 && (
-        <button className="sample-data-button" onClick={onSampleData} disabled={sampleLoading}>
-          <Database size={15} />
-          {sampleLoading ? 'Loading sample data…' : 'Try the sample dataset'}
-        </button>
-      )}
       <div className="suggestion-grid">
         {suggestions.map(({ icon: Icon }, index) => (
           <button key={labels[index]} onClick={() => onSuggestion(labels[index])}>
@@ -1153,7 +1178,7 @@ function Message({ message }: { message: WorkbenchState['messages'][number] }) {
           <span>{new Date(message.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
         </div>
         <div className={`message-text ${isAssistant ? 'markdown-body' : ''}`}>
-          {isAssistant ? <ReactMarkdown>{message.content}</ReactMarkdown> : message.content}
+          {isAssistant ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown> : message.content}
           {message.streaming && <span className="stream-caret" />}
         </div>
       </div>
@@ -1285,6 +1310,7 @@ function Canvas({
   fullscreen,
   onFullscreen,
   onSelectArtifact,
+  onMinimize,
 }: {
   sessionId?: string;
   artifact?: WorkbenchState['artifact'];
@@ -1294,6 +1320,7 @@ function Canvas({
   fullscreen: boolean;
   onFullscreen: () => void;
   onSelectArtifact: (name: string) => void;
+  onMinimize: () => void;
 }) {
   const [zoom, setZoom] = useState(100);
   const [refreshKey, setRefreshKey] = useState(0);
@@ -1356,6 +1383,9 @@ function Canvas({
           <span className="toolbar-divider" />
           <button className="icon-button" aria-label="Refresh artifact" onClick={() => setRefreshKey((value) => value + 1)}>
             <RefreshCw size={15} />
+          </button>
+          <button className="icon-button" aria-label="Minimize canvas panel" title="Minimize canvas" onClick={onMinimize}>
+            <PanelRightClose size={15} />
           </button>
           <button className="icon-button" aria-label={fullscreen ? 'Exit full screen' : 'Enter full screen'} onClick={onFullscreen}>
             {fullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
