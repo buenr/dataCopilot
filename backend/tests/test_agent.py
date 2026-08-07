@@ -4,7 +4,10 @@ from pathlib import Path
 
 import pytest
 from app.agent import (
+    MAX_TURN_STEPS,
     PDF_RESCUE_CODE,
+    WRAP_UP_NUDGE,
+    WRAP_UP_REMAINING_STEPS,
     Agent,
     AnthropicProvider,
     MockProvider,
@@ -390,12 +393,13 @@ def sales_profile() -> list[dict]:
 
 
 @pytest.mark.asyncio
-async def test_dashboard_fallback_contains_profiled_values(tmp_path: Path):
-    sandbox = FakeSandbox("grounded", tmp_path / "workspace")
+async def test_placeholder_dashboard_is_served_as_written(tmp_path: Path):
+    """An empty-shell dashboard is the model's own output: publish it, never swap it."""
+    sandbox = FakeSandbox("placeholder", tmp_path / "workspace")
     agent = Agent(
         sandbox,
         DashboardPlaceholderProvider(),
-        "grounded",
+        "placeholder",
         tmp_path / "sessions",
         dataset_context=sales_profile,
     )
@@ -407,13 +411,10 @@ async def test_dashboard_fallback_contains_profiled_values(tmp_path: Path):
     finally:
         await sandbox.close()
 
-    assert artifact["name"] == "data_grounded_dashboard.html"
-    assert artifact["port"] == 8502
-    assert "4" in content
-    assert "1,172.50" in content
-    assert "950" in content
-    assert "Key insights" in content
-    assert "chart-row" in content
+    assert artifact["name"] == "dashboard.html"
+    assert artifact["port"] == 8501
+    assert "Analysis complete" in content
+    assert not (tmp_path / "workspace" / "data_grounded_dashboard.html").exists()
 
 
 @pytest.mark.asyncio
@@ -435,15 +436,6 @@ async def test_grounded_dashboard_is_preserved(tmp_path: Path):
     artifacts = [event for event in events if event["type"] == "artifact"]
     assert [artifact["name"] for artifact in artifacts] == ["dashboard.html"]
     assert artifacts[0]["port"] == 8501
-
-
-def test_dashboard_data_check_ignores_script_only_values():
-    html = (
-        "<h1>Sales</h1><script>const DATA = "
-        '{"file":"sales.csv","rows":4,"revenue":950,"mean":1172.5}</script>'
-    )
-
-    assert not Agent._dashboard_has_visible_data(html, sales_profile())
 
 
 def test_static_dashboard_preview_keeps_workspace_relative_html_path():
@@ -482,13 +474,8 @@ class ReportWithoutPdfProvider:
 
 
 @pytest.mark.asyncio
-async def test_report_request_explains_why_no_pdf_reached_the_canvas(
-    tmp_path: Path, monkeypatch
-):
+async def test_report_request_explains_why_no_pdf_reached_the_canvas(tmp_path: Path):
     sandbox = FakeSandbox("report-no-pdf", tmp_path / "workspace")
-    # Point the fallback PDF writer at a missing directory so the write fails
-    # and the turn has to explain itself with the real kernel error.
-    monkeypatch.setenv("SANDBOX_WORKSPACE", str(tmp_path / "missing"))
     agent = Agent(
         sandbox,
         ReportWithoutPdfProvider(),
@@ -504,8 +491,7 @@ async def test_report_request_explains_why_no_pdf_reached_the_canvas(
     assert not any(event["type"] == "artifact" for event in events)
     message = next(event for event in events if event["type"] == "assistant_message")
     assert "could not put a PDF on the canvas" in message["content"]
-    assert "fallback PDF generator failed" in message["content"]
-    assert "FileNotFoundError" in message["content"]
+    assert "no PDF artifact was found in the sandbox workspace" in message["content"]
 
 
 def run_pdf_rescue(workspace: Path, working_directory: Path, monkeypatch) -> None:
@@ -711,13 +697,13 @@ class AnalysisNoPdfProvider:
 
 
 @pytest.mark.asyncio
-async def test_fallback_pdf_generated_when_provider_omits_pdf(tmp_path: Path):
-    """When the LLM analyzes data but never writes a PDF, the agent builds one."""
-    sandbox = FakeSandbox("fallback-pdf", tmp_path / "workspace")
+async def test_report_without_pdf_is_explained_not_fabricated(tmp_path: Path):
+    """When the LLM analyzes data but never writes a PDF, no fake is published."""
+    sandbox = FakeSandbox("no-pdf", tmp_path / "workspace")
     agent = Agent(
         sandbox,
         AnalysisNoPdfProvider(),
-        "fallback-pdf",
+        "no-pdf",
         tmp_path / "sessions",
     )
 
@@ -726,52 +712,13 @@ async def test_fallback_pdf_generated_when_provider_omits_pdf(tmp_path: Path):
     finally:
         await sandbox.close()
 
-    artifact = next(event for event in events if event["type"] == "artifact")
-    assert artifact["name"] == "report.pdf"
-    assert artifact["artifact"]["type"] == "pdf"
+    assert not any(event["type"] == "artifact" for event in events)
+    assert not (sandbox.root / "report.pdf").exists()
     assert any(
         event["type"] == "assistant_message"
-        and "ready in the canvas" in event["content"]
+        and "could not put a PDF on the canvas" in event["content"]
         for event in events
     )
-    # The fallback PDF must be a valid PDF file in the workspace.
-    pdf_path = sandbox.root / "report.pdf"
-    assert pdf_path.exists()
-    assert pdf_path.read_bytes().startswith(b"%PDF-")
-
-
-class ClobberingNoPdfProvider:
-    """Runs analysis, clobbers the WORKSPACE global, never writes a PDF."""
-
-    def __init__(self) -> None:
-        self.calls = 0
-
-    async def stream(self, messages, tools):
-        self.calls += 1
-        if self.calls == 1:
-            yield {
-                "tool": "run_python",
-                "arguments": {"code": "WORKSPACE = '/app'\nprint('rows: 150')"},
-            }
-        elif self.calls == 2:
-            yield "Analysis complete."
-
-
-@pytest.mark.asyncio
-async def test_fallback_pdf_survives_clobbered_workspace(tmp_path: Path, monkeypatch):
-    """Agent code can reassign WORKSPACE; the fallback must use the real one."""
-    sandbox = FakeSandbox("clobber", tmp_path / "workspace")
-    monkeypatch.setenv("SANDBOX_WORKSPACE", str(sandbox.root))
-    agent = Agent(sandbox, ClobberingNoPdfProvider(), "clobber", tmp_path / "sessions")
-
-    try:
-        events = [event async for event in agent.turn("Create a report")]
-    finally:
-        await sandbox.close()
-
-    artifact = next(event for event in events if event["type"] == "artifact")
-    assert artifact["name"] == "report.pdf"
-    assert (sandbox.root / "report.pdf").read_bytes().startswith(b"%PDF-")
 
 
 class SilentNoPdfProvider:
@@ -788,8 +735,8 @@ class SilentNoPdfProvider:
 
 
 @pytest.mark.asyncio
-async def test_fallback_pdf_generated_even_without_any_text(tmp_path: Path):
-    """A report request must produce a PDF even when the provider says nothing."""
+async def test_silent_report_turn_is_explained_not_fabricated(tmp_path: Path):
+    """A report request publishes nothing when the provider never wrote a PDF."""
     sandbox = FakeSandbox("silent", tmp_path / "workspace")
     agent = Agent(sandbox, SilentNoPdfProvider(), "silent", tmp_path / "sessions")
 
@@ -798,9 +745,13 @@ async def test_fallback_pdf_generated_even_without_any_text(tmp_path: Path):
     finally:
         await sandbox.close()
 
-    artifact = next(event for event in events if event["type"] == "artifact")
-    assert artifact["name"] == "report.pdf"
-    assert (sandbox.root / "report.pdf").read_bytes().startswith(b"%PDF-")
+    assert not any(event["type"] == "artifact" for event in events)
+    assert not (sandbox.root / "report.pdf").exists()
+    assert any(
+        event["type"] == "assistant_message"
+        and "could not put a PDF on the canvas" in event["content"]
+        for event in events
+    )
 
 
 @pytest.mark.asyncio
@@ -1041,7 +992,7 @@ class _DashboardOnlyProvider:
 
 
 @pytest.mark.asyncio
-async def test_combined_turn_still_recovers_missing_pdf(tmp_path: Path):
+async def test_combined_turn_reports_the_missing_pdf_honestly(tmp_path: Path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     (workspace / "dashboard.html").write_text("<!doctype html><p>data</p>")
@@ -1055,5 +1006,97 @@ async def test_combined_turn_still_recovers_missing_pdf(tmp_path: Path):
 
     names = [event.get("name") for event in events if event["type"] == "artifact"]
     assert "dashboard.html" in names
-    # Publishing the dashboard must not suppress the PDF recovery.
-    assert any(str(name).endswith(".pdf") for name in names)
+    # Publishing the dashboard must not fabricate a PDF that was never written.
+    assert not any(str(name).endswith(".pdf") for name in names)
+    assert any(
+        event["type"] == "assistant_message"
+        and "could not put a PDF on the canvas" in event["content"]
+        for event in events
+    )
+
+
+class EndlessExplorerProvider:
+    """Calls run_python forever, never writing or registering an artifact."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.requests: list[list[dict]] = []
+
+    async def stream(self, messages, tools):
+        self.calls += 1
+        self.requests.append([dict(message) for message in messages])
+        yield {"tool": "run_python", "arguments": {"code": f"print({self.calls})"}}
+
+
+@pytest.mark.asyncio
+async def test_turn_stops_after_sixteen_rounds_and_says_so(tmp_path: Path):
+    provider = EndlessExplorerProvider()
+    sandbox = FakeSandbox("cap", tmp_path / "workspace")
+    agent = Agent(sandbox, provider, "cap", tmp_path / "sessions")
+
+    try:
+        events = [event async for event in agent.turn("Analyze the data")]
+    finally:
+        await sandbox.close()
+
+    assert provider.calls == MAX_TURN_STEPS
+    message = next(event for event in events if event["type"] == "assistant_message")
+    assert "ran out of steps" in message["content"]
+    assert "continue" in message["content"]
+
+
+@pytest.mark.asyncio
+async def test_wrap_up_nudge_reaches_the_provider_before_the_cap(tmp_path: Path):
+    provider = EndlessExplorerProvider()
+    sandbox = FakeSandbox("nudge", tmp_path / "workspace")
+    agent = Agent(sandbox, provider, "nudge", tmp_path / "sessions")
+
+    try:
+        [event async for event in agent.turn("Analyze the data")]
+    finally:
+        await sandbox.close()
+
+    assert f"only {WRAP_UP_REMAINING_STEPS} tool rounds remain" in WRAP_UP_NUDGE
+    before = provider.requests[: MAX_TURN_STEPS - WRAP_UP_REMAINING_STEPS]
+    nudged = provider.requests[MAX_TURN_STEPS - WRAP_UP_REMAINING_STEPS]
+    assert not any(WRAP_UP_NUDGE in str(message) for call in before for message in call)
+    assert any(
+        message.get("role") == "tool" and WRAP_UP_NUDGE in str(message.get("content", ""))
+        for message in nudged
+    )
+
+
+@pytest.mark.asyncio
+async def test_exhausted_report_turn_says_so_instead_of_faking_a_pdf(tmp_path: Path):
+    provider = EndlessExplorerProvider()
+    sandbox = FakeSandbox("exhausted", tmp_path / "workspace")
+    agent = Agent(sandbox, provider, "exhausted", tmp_path / "sessions")
+
+    try:
+        events = [event async for event in agent.turn("Create a PDF report")]
+    finally:
+        await sandbox.close()
+
+    assert not any(event["type"] == "artifact" for event in events)
+    assert not (sandbox.root / "report.pdf").exists()
+    message = next(event for event in events if event["type"] == "assistant_message")
+    assert "ran out of steps" in message["content"]
+    assert "continue" in message["content"]
+
+
+@pytest.mark.asyncio
+async def test_exhausted_dashboard_turn_says_so_instead_of_faking_html(tmp_path: Path):
+    provider = EndlessExplorerProvider()
+    sandbox = FakeSandbox("exhausted-dash", tmp_path / "workspace")
+    agent = Agent(sandbox, provider, "exhausted-dash", tmp_path / "sessions")
+
+    try:
+        events = [event async for event in agent.turn("Build a dashboard")]
+    finally:
+        await sandbox.close()
+
+    assert not any(event["type"] == "artifact" for event in events)
+    assert not (sandbox.root / "data_grounded_dashboard.html").exists()
+    message = next(event for event in events if event["type"] == "assistant_message")
+    assert "ran out of steps" in message["content"]
+    assert "continue" in message["content"]
