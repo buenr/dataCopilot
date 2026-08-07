@@ -23,6 +23,10 @@ export type WorkbenchState = {
   execution: ExecutionState;
   thinking: boolean;
   turnActive: boolean;
+  // Live progress for the chat status line ("round 9 of 16 · writing report");
+  // the backend emits one turn_step event per agent round.
+  turnStep: { step: number; maxSteps: number } | null;
+  turnPhase: string;
   setSessionId: (sessionId: string) => void;
   setConnection: (connection: ConnectionState) => void;
   addMessage: (message: ChatMessage) => void;
@@ -45,6 +49,8 @@ export type WorkbenchState = {
   appendExecutionOutput: (stream: 'stdout' | 'stderr', data: string) => void;
   setThinking: (value: boolean) => void;
   setTurnActive: (value: boolean) => void;
+  setTurnStep: (value: { step: number; maxSteps: number } | null) => void;
+  setTurnPhase: (value: string) => void;
   reset: () => void;
 };
 
@@ -76,6 +82,8 @@ export const useWorkbench = create<WorkbenchState>((set) => ({
   execution: defaultExecution,
   thinking: false,
   turnActive: false,
+  turnStep: null,
+  turnPhase: '',
   setSessionId: (sessionId) => set({ sessionId }),
   setConnection: (connection) => set({ connection }),
   addMessage: (message) => set((state) => ({ messages: [...state.messages, message] })),
@@ -172,6 +180,8 @@ export const useWorkbench = create<WorkbenchState>((set) => ({
     })),
   setThinking: (thinking) => set({ thinking }),
   setTurnActive: (turnActive) => set({ turnActive }),
+  setTurnStep: (turnStep) => set({ turnStep }),
+  setTurnPhase: (turnPhase) => set({ turnPhase }),
   reset: () =>
     set({
       messages: [],
@@ -183,5 +193,7 @@ export const useWorkbench = create<WorkbenchState>((set) => ({
       execution: { ...defaultExecution },
       thinking: false,
       turnActive: false,
+      turnStep: null,
+      turnPhase: '',
     }),
 }));

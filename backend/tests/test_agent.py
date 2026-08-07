@@ -1067,6 +1067,28 @@ async def test_wrap_up_nudge_reaches_the_provider_before_the_cap(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_turn_step_events_track_every_round_and_the_nudge(tmp_path: Path):
+    provider = EndlessExplorerProvider()
+    sandbox = FakeSandbox("progress", tmp_path / "workspace")
+    agent = Agent(sandbox, provider, "progress", tmp_path / "sessions")
+
+    try:
+        events = [event async for event in agent.turn("Analyze the data")]
+    finally:
+        await sandbox.close()
+
+    # The chat status line ("round N of M · …") is built from these events, so
+    # every provider round must announce itself, in order, against the cap.
+    steps = [event for event in events if event["type"] == "turn_step"]
+    assert [event["step"] for event in steps] == list(range(1, MAX_TURN_STEPS + 1))
+    assert all(event["max_steps"] == MAX_TURN_STEPS for event in steps)
+    nudges = [event for event in events if event["type"] == "wrap_up_nudge"]
+    assert [event["step"] for event in nudges] == [
+        MAX_TURN_STEPS - WRAP_UP_REMAINING_STEPS + 1
+    ]
+
+
+@pytest.mark.asyncio
 async def test_exhausted_report_turn_says_so_instead_of_faking_a_pdf(tmp_path: Path):
     provider = EndlessExplorerProvider()
     sandbox = FakeSandbox("exhausted", tmp_path / "workspace")

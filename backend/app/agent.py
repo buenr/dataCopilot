@@ -1031,6 +1031,12 @@ class Agent:
                 ):
                     request_messages[-1]["content"] += "\n\n" + WRAP_UP_NUDGE
                     self.dispatcher.record({"type": "wrap_up_nudge", "step": step + 1})
+                    # Surfaced to the chat status line as well as the
+                    # trajectory, so the wind-down is visible while it happens.
+                    yield {"type": "wrap_up_nudge", "step": step + 1}
+                # Drives the chat status line ("round 9 of 16 · …") during
+                # long turns; the inspector already shows the tool trail.
+                yield {"type": "turn_step", "step": step + 1, "max_steps": MAX_TURN_STEPS}
                 text_parts: list[str] = []
                 tool_calls: list[tuple[str, str, dict[str, Any], dict[str, Any]]] = []
                 async for item in self.provider.stream(request_messages, TOOL_DEFINITIONS):
