@@ -1,0 +1,187 @@
+# Product Requirements Document (PRD)
+
+## Project Title: Enterprise Agent Workbench & Coding Harness ("Data Copilot")
+
+---
+
+## 1. Executive Summary & Vision
+
+**Data Copilot** is an enterprise-grade AI analytics and application workspace that combines an **autonomous, Python-driven agent harness** with a **modern canvas frontend** (combining conversational AI with Tableau/PowerBI-style visual output).
+
+Instead of relying on rigid, drag-and-drop dashboard builders, the system treats the AI agent as a full-stack data scientist and developer. Users upload raw datasets or trigger saved workflows, and the agent executes code within a persistent, sandboxed IPython control plane to generate **interactive web applications** (e.g., Streamlit, Dash, custom HTML/JS) and **publication-ready PDF whitepapers** displayed side-by-side with the chat interface.
+
+---
+
+## 2. Core Architectural Foundations
+
+* Decoupled backend architecture separating provider LLM APIs, agent event-driven execution loops, and the workspace UI/proxy layers.
+* Structured event trajectories (JSONL format) tracking tool calls, execution steps, code generation, and terminal state outputs.
+
+
+* **Recursive Language Model (RLM) Paradigm:** Code execution occurs inside a persistent IPython kernel rather than stateless tool dispatches.
+* Context-as-variables: Dataframes, raw outputs, and execution results remain resident in memory across conversational turns.
+
+
+
+---
+
+## 3. High-Level System Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      Enterprise Workbench Frontend                       │
+│  ┌───────────────────────┬───────────────────────────────────────────┐  │
+│  │   Conversational AI   │        Artifact Output Canvas             │  │
+│  │     Chat & Control    │   ┌───────────────────────────────────┐   │  │
+│  │     (Stream/RPC)      │   │  Dynamic iFrame Proxy (Webapp)    │   │  │
+│  │                       │   │  or Live PDF Viewer (Whitepaper)  │   │  │
+│  └───────────────────────┴───────────────────────────────────────────┘  │
+└────────────────────────────────────┬────────────────────────────────────┘
+                                     │ WebSocket / REST API
+┌────────────────────────────────────▼────────────────────────────────────┐
+│                    API Gateway & Tenant Session Manager                  │
+└────────────────────────────────────┬────────────────────────────────────┘
+                                     │ Isolated Network Routing
+┌────────────────────────────────────▼────────────────────────────────────┐
+│                  Per-Session Container Sandbox (Docker/K8s)              │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  Python/IPython Kernel Engine (Control Plane)                  │  │
+│  │  - Preloaded DataFrames (df_1, df_2) & Profiling                   │  │
+│  │  - Python Execution Libraries (Typst, WeasyPrint, Streamlit, etc.)│  │
+│  │  - Local Micro-Webserver / iFrame Proxy Target                    │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────┘
+
+```
+
+---
+
+## 4. Subsystem Requirements & Feature Specifications
+
+### 4.1 Frontend Workspace (Tableau / PowerBI Style Canvas)
+
+| Component | Description | Functional Requirements |
+| --- | --- | --- |
+| **Split-Screen Layout** | Main layout divided into chat/control and visual canvas. | Resizable split-pane view (default 35% chat, 65% canvas). Support full-screen toggle for the Canvas. |
+| **Artifact Output Canvas** | Primary visual area for agent outputs. | Dual-mode display:<br>
+
+<br>1. **Webapp Mode:** Embedded, sandboxed `iframe` rendering live interactive web applications.<br>
+
+<br>2. **Document Mode:** High-performance PDF renderer with zoom, search, and export options. |
+| **Data & Schema Explorer** | Sidebar panel for dataset inspection. | Displays uploaded files, auto-detected schemas, data types, row/column counts, and pre-allocated variable names (e.g., `df_1`, `df_2`). |
+| **Execution Inspector** | Collapsible developer pane beneath chat. | Real-time stream of IPython stdout/stderr, execution logs, active variable lists, and generated code snippets. |
+
+---
+
+### 4.2 Data Ingestion & Auto-Profiling Engine
+
+* **File Support:** Ingest CSV, Excel (`.xlsx`, `.xls`), Parquet, and JSON datasets.
+* **Automated Data Preloading:**
+* Upon upload, the backend automatically transfers files to the session's isolated workspace.
+* The system executes an auto-profiling script within the persistent IPython kernel:
+* Loads datasets into Pandas/Polars DataFrames named sequentially (`df_1`, `df_2`, etc.).
+* Generates schema summaries (column names, data types, missing value percentages, basic statistical distributions).
+
+
+* System prompt is updated dynamically with dataset summaries so the LLM immediately understands the data context without extra turns.
+
+
+
+---
+
+### 4.3 Backend Agent Harness & IPython Control Plane
+
+* **Persistent IPython Kernel:**
+* Runs a stateful Python REPL per user session.
+* Retains variables, imported packages, processed data, and state across all prompt interactions.
+
+
+* **Tool & Code Execution:**
+* The agent generates executable Python code blocks directly.
+* Built-in execution recovery: If an error occurs (e.g., `KeyError`, `ImportError`), stderr is fed back into the agent loop for automated self-correction (up to 3 retries per turn).
+
+
+* **Library Runtime Pre-installations:**
+* **Data Analysis:** `pandas`, `polars`, `numpy`, `scipy`.
+* **Webapp Generation:** `streamlit`, `dash`, `nicegui`, `fastapi`, `uvicorn`, `bottle`.
+* **PDF & Chart Generation:** `typst`, `weasyprint`, `reportlab`, `matplotlib`, `seaborn`, `plotly`.
+
+
+
+---
+
+### 4.4 Artifact Rendering & Hosting Pipelines
+
+#### A. Interactive Web applications
+
+1. When the user requests a web application/dashboard, the agent generates application code (e.g., a Streamlit app or standalone HTML/JS server) within the tenant container.
+2. The agent launches a local background process serving the app on an internal container port (e.g., `localhost:8501`).
+3. The platform gateway proxies this internal port to a secure tenant sub-path (`/session/{session_id}/preview/`).
+4. The Workbench Canvas embeds this URL inside an isolated `iframe` with `sandbox="allow-scripts allow-same-origin allow-forms"`.
+
+#### B. Whitepaper PDF Reports
+
+1. When a PDF report/whitepaper is requested, the agent uses standard Python libraries (`typst`, `weasyprint`, or `reportlab`) to compile data insights, charts, and structured text into a PDF file.
+2. The compiled PDF is saved in the session volume (e.g., `output_report.pdf`).
+3. The backend notifies the UI via WebSocket, streaming or linking the file directly into the Canvas PDF previewer.
+
+---
+
+### 4.5 Workflow Automation & Scheduled Triggers
+
+* **Saved Prompt Templates:**
+* Users can save successful agent prompts/trajectories as named "Workflow Templates" (e.g., *Weekly Executive Sales Brief*).
+
+
+* **Scheduled Execution:**
+* Workflows can be scheduled (CRON style) or triggered via API endpoints.
+* On trigger, the platform loads the latest uploaded or refreshed data into a fresh session container, re-evaluates the prompt template, generates new AI-driven analysis, and emits an updated PDF/Webapp artifact automatically.
+
+
+
+---
+
+## 5. Security, Isolation & Sandbox Lifecycle
+
+```
+[User Session Start] ──► [Provision Container] ──► [Mount Data] ──► [Spin up IPython]
+                                                                         │
+[Session Teardown]   ◄── [Clean Temp Storage] ◄── [Inactivity Timeout (30 min)]
+
+```
+
+* **Per-Session Isolation:**
+* Each active workspace session provisions an isolated Docker container or micro-VM.
+* Strictly no shared memory, IPC, or filesystem access between tenant containers.
+
+
+* **Container Lifecycle Management:**
+* **Warm Start:** Containers spin up on workspace launch (< 3-second startup target).
+* **Inactivity TTL:** Containers auto-terminate after 30 minutes of idle inactivity, wiping ephemeral storage unless saved into persistent workflow storage.
+
+
+* **Network & Resource Guardrails:**
+* CPU/RAM resource limits per container (e.g., 2 vCPU, 4GB RAM max for POC).
+* Outbound network egress blocked by default, except for explicitly whitelisted LLM API endpoints.
+
+
+
+---
+
+## 6. Technology Stack Recommendations (POC Stage)
+
+* **Frontend:** Next.js (TypeScript), Tailwind CSS, Lucide Icons, `react-pdf-viewer` or PDF.js, Shadcn UI.
+* **Backend Gateway:** Python (FastAPI) with WebSockets for LLM streaming and log tailing.
+* **Agent Harness Engine:** Custom lightweight harness built on `pi-agent-core` patterns + IPython Kernel Gateway (`jupyter_client`).
+* **Container Infrastructure:** Docker with Python 3.11 runtime image, managed via FastAPI session orchestrator.
+
+---
+
+## 7. Key Success Criteria & MVP Benchmarks
+
+1. **Auto-Data Loading:** CSV/Excel files auto-load into `df_1` with schema summary in system prompt in under 2 seconds.
+2. **Webapp Rendering:** Agent successfully generates, starts, and embeds a working Streamlit or HTML dashboard in the canvas within 30 seconds of user request.
+3. **PDF Generation:** Agent generates a multi-page PDF whitepaper with embedded charts and formatted text without throwing unhandled Python errors.
+4. **Interactive Sandbox Safety:** Session containers isolate untrusted code execution completely from the main application server.
+
+---
