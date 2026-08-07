@@ -25,6 +25,17 @@ def _workspace_relative(path: Any) -> str:
     if text.startswith("/workspace/"):
         return text[len("/workspace/"):]
     return text
+# Tool-call rounds allowed per turn, for every request. Sixteen gives slower
+# providers room to explore and still author the artifact; two rounds before
+# the cap a wrap-up nudge is folded into the running history so the model
+# spends its last steps writing instead of exploring.
+MAX_TURN_STEPS = 16
+WRAP_UP_NUDGE = (
+    "Step budget nearly exhausted: only 2 tool rounds remain. Stop exploring "
+    "and finish with what you have: write the requested artifact to the "
+    "workspace, call register_artifact, then summarize your findings."
+)
+
 # The kernel preloads WORKSPACE for convenience, but agent code can reassign it,
 # so this snippet resolves the real workspace from the sandbox environment. A
 # wrong destination would silently copy a rescued PDF back onto itself.
@@ -781,75 +792,12 @@ class Agent:
         path = str(artifact.get("path") or artifact.get("name") or "").lower()
         return artifact.get("type") == "pdf" or path.endswith(".pdf")
 
-    @staticmethod
-    def _fallback_pdf_code(content: str) -> str:
-        """Return sandbox code that builds a simple PDF from analysis text.
-
-        Dependency-free (same raw-PDF approach as the mock provider) so it
-        works in both the Docker sandbox and the in-process FakeSandbox.
-        Content is base64-encoded to avoid all escaping issues.
-        """
-        import base64
-
-        content_b64 = base64.b64encode(content.encode()).decode()
-        return '''
-import base64
-import os
-from pathlib import Path
-
-# The kernel preloads WORKSPACE, but agent code can clobber it; the sandbox
-# image always sets SANDBOX_WORKSPACE, so prefer it (same as the rescue sweep).
-workspace = Path(os.environ.get("SANDBOX_WORKSPACE") or WORKSPACE)
-content = base64.b64decode("''' + content_b64 + '''").decode()
-
-lines = content.split("\\n")[:35]
-objects = [
-    b"<< /Type /Catalog /Pages 2 0 R >>",
-    b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-    b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
-]
-parts = []
-y = 700
-for line in lines:
-    esc = line.replace("\\\\", "\\\\\\\\").replace("(", "\\\\(").replace(")", "\\\\)")
-    parts.append("BT /F1 11 Tf 72 " + str(y) + " Td (" + esc + ") Tj ET")
-    y -= 16
-data = "\\n".join(parts).encode()
-objects.append(b"<< /Length " + str(len(data)).encode() + b" >>\\nstream\\n" + data + b"endstream")
-objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
-
-pdf = bytearray(b"%PDF-1.4\\n")
-offsets = [0]
-for i, obj in enumerate(objects, 1):
-    offsets.append(len(pdf))
-    pdf.extend(str(i).encode() + b" 0 obj\\n" + obj + b"\\nendobj\\n")
-xref = len(pdf)
-pdf.extend(b"xref\\n0 " + str(len(objects) + 1).encode() + b"\\n0000000000 65535 f \\n")
-for off in offsets[1:]:
-    pdf.extend(str(off).zfill(10).encode() + b" 00000 n \\n")
-pdf.extend(b"trailer\\n<< /Size " + str(len(objects) + 1).encode() + b" /Root 1 0 R >>\\nstartxref\\n" + str(xref).encode() + b"\\n%%EOF\\n")
-(workspace / "report.pdf").write_bytes(bytes(pdf))
-print("Fallback PDF written")
-'''
-
-    @staticmethod
-    def _dataset_summary_text(profiles: list[dict[str, Any]] | None) -> str:
-        """Minimal report content when a provider produced no text at all."""
-        lines = ["Data Copilot report", ""]
-        for profile in profiles or []:
-            lines.append(
-                f"{profile.get('name', 'dataset')} ({profile.get('file', 'unknown')}): "
-                f"{profile.get('rows', '?')} rows x {profile.get('columns', '?')} columns"
-            )
-        return "\n".join(lines)
-
-    async def _recover_pdf_artifact(
-        self, fallback_content: str = ""
-    ) -> tuple[dict[str, Any] | None, str | None]:
+    async def _recover_pdf_artifact(self) -> tuple[dict[str, Any] | None, str | None]:
         """Recover a PDF when a provider wrote it but omitted the handoff.
 
-        If no PDF exists after the rescue sweep, generate one from the
-        assistant's analysis text so the user always gets a canvas artifact.
+        Only a real PDF found in the sandbox is published. When the provider
+        never wrote one, the caller says so instead of fabricating a document
+        from raw tool output.
         """
         async def find_pdf() -> str | None:
             listing = await self.dispatcher.dispatch("list_files", {"path": "."})
@@ -881,20 +829,7 @@ print("Fallback PDF written")
             if not pdf_path and not hasattr(self.dispatcher.sandbox, "root"):
                 await self.dispatcher.dispatch("run_python", {"code": PDF_RESCUE_CODE})
                 pdf_path = await find_pdf()
-            fallback_result: dict[str, Any] = {}
             if not pdf_path:
-                # The provider ran analysis but never wrote a PDF. Build one
-                # from the collected output so the canvas is not empty.
-                fallback_result = await self.dispatcher.dispatch(
-                    "run_python", {"code": self._fallback_pdf_code(fallback_content)}
-                )
-                pdf_path = await find_pdf()
-            if not pdf_path:
-                # run_python reports code failures as stderr, not exceptions, so
-                # surface the real reason instead of a generic "not found".
-                stderr = str(fallback_result.get("stderr") or "").strip()
-                if stderr:
-                    return None, f"the fallback PDF generator failed: {stderr.splitlines()[-1]}"
                 return None, "no PDF artifact was found in the sandbox workspace"
             artifact_result = await self.dispatcher.dispatch(
                 "register_artifact",
@@ -1278,11 +1213,15 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
             published_pdf = False
             published_webapp = False
             started_ports: dict[int, str] = {}
-            all_text: list[str] = []
-            run_python_outputs: list[str] = []
-            # Eight rounds give slower providers room to explore and still write
-            # the artifact; the fallback below covers turns that exhaust it.
-            for _ in range(8):
+            # The nudge is folded into the latest tool result rather than sent
+            # as its own message: mid-conversation system messages are dropped
+            # by the Anthropic and OpenAI Responses adapters, and a bare user
+            # message would break Anthropic's role alternation.
+            steps_exhausted = True
+            for step in range(MAX_TURN_STEPS):
+                if step == MAX_TURN_STEPS - 2 and request_messages[-1].get("role") == "tool":
+                    request_messages[-1]["content"] += "\n\n" + WRAP_UP_NUDGE
+                    self.dispatcher.record({"type": "wrap_up_nudge", "step": step + 1})
                 text_parts: list[str] = []
                 tool_calls: list[tuple[str, str, dict[str, Any], dict[str, Any]]] = []
                 async for item in self.provider.stream(request_messages, TOOL_DEFINITIONS):
@@ -1332,9 +1271,6 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
                     tool_calls.append((provider_call_id, item["tool"], arguments, tool_result))
                     yield {"type": "tool_result", "id": tool_id, "tool": item["tool"], **tool_result}
                     if item["tool"] == "run_python":
-                        stdout = str(tool_result.get("stdout", ""))
-                        if stdout.strip():
-                            run_python_outputs.append(stdout.strip())
                         try:
                             variables = await self.dispatcher.sandbox.vars()
                         except Exception:
@@ -1410,9 +1346,8 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
                                 "artifact": artifact,
                             }
                 final_text = "".join(text_parts)
-                if final_text:
-                    all_text.append(final_text)
                 if not tool_calls:
+                    steps_exhausted = False
                     break
                 request_messages.append(
                     {
@@ -1441,14 +1376,7 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
                         }
                     )
             if report_request and not published_pdf:
-                fallback_content = "\n\n".join(all_text or run_python_outputs)
-                if not fallback_content:
-                    # The provider hit the step cap without saying anything;
-                    # fall back to a dataset summary so the PDF still has content.
-                    fallback_content = self._dataset_summary_text(dataset_profiles)
-                recovered, recovery_error = await self._recover_pdf_artifact(
-                    fallback_content
-                )
+                recovered, recovery_error = await self._recover_pdf_artifact()
                 if recovered:
                     self.dispatcher.record(
                         {"type": "artifact_recovered", "artifact": recovered}
@@ -1464,12 +1392,26 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
                         if final_text
                         else "The PDF report is ready in the canvas."
                     )
+                elif steps_exhausted:
+                    notice = (
+                        "I ran out of steps before I could finish the PDF report, "
+                        "so nothing was published to the canvas. Ask me to "
+                        "continue and I'll pick up where I left off."
+                    )
+                    final_text = f"{final_text}\n\n{notice}" if final_text else notice
                 else:
                     notice = (
                         "I generated report work, but could not put a PDF on the "
                         f"canvas: {recovery_error}."
                     )
                     final_text = f"{final_text}\n\n{notice}" if final_text else notice
+            elif steps_exhausted:
+                notice = (
+                    "I ran out of steps before finishing, so this answer may be "
+                    "incomplete. Ask me to continue and I'll pick up where I "
+                    "left off."
+                )
+                final_text = f"{final_text}\n\n{notice}" if final_text else notice
             if dashboard_request and not published_webapp:
                 recovered, recovery_error = await self._recover_dashboard_artifact(
                     started_ports,
