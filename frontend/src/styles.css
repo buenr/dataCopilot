@@ -112,9 +112,7 @@ h1, h2, p { margin: 0; }
 .welcome h2 { margin-top: 10px; color: #f0f4fb; font: 600 25px/1.2 'Space Grotesk', sans-serif; letter-spacing: -.045em; }
 .welcome h2 span { color: #8393ad; }
 .welcome > p { max-width: 390px; margin-top: 14px; color: #818fa3; font-size: 12px; line-height: 1.65; }
-.sample-data-button { display: inline-flex; align-items: center; gap: 8px; margin-top: 16px; padding: 9px 16px; border: 1px solid #3f6091; border-radius: 6px; color: #cfe0f7; background: linear-gradient(135deg, rgba(81, 127, 208, .25), rgba(126, 168, 239, .12)); font-size: 11px; font-weight: 600; cursor: pointer; transition: border .16s, background .16s, transform .16s; }
-.sample-data-button:hover:not(:disabled) { border-color: #7ea8ef; background: rgba(81, 127, 208, .35); transform: translateY(-1px); }
-.sample-data-button:disabled { opacity: .55; cursor: wait; }
+
 .suggestion-grid { width: 100%; display: grid; grid-template-columns: 1fr 1fr; gap: 7px; margin-top: 25px; }
 .suggestion-grid button { display: flex; align-items: center; gap: 8px; min-height: 37px; padding: 0 10px; border: 1px solid #223044; border-radius: 5px; color: #9baac0; background: rgba(17, 24, 34, .7); text-align: left; font-size: 10px; cursor: pointer; transition: border .16s, background .16s, color .16s; }
 .suggestion-grid button:hover { border-color: #45648f; color: #d0ddf1; background: #152132; }

@@ -44,7 +44,6 @@ import {
   deleteDataset,
   deleteSession,
   getSession,
-  loadSampleData,
   uploadDataset,
   websocketUrl,
 } from './lib/api';
@@ -199,7 +198,6 @@ export default function App() {
   const [draft, setDraft] = useState('');
   const [sessionError, setSessionError] = useState('');
   const [uploading, setUploading] = useState(false);
-  const [sampleLoading, setSampleLoading] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [dragOver, setDragOver] = useState(false);
   const [sessionKey, setSessionKey] = useState(0);
@@ -567,22 +565,6 @@ export default function App() {
     }
   };
 
-  const handleSampleData = async () => {
-    if (!sessionId || sampleLoading) return;
-    setSampleLoading(true);
-    try {
-      const response = await loadSampleData(sessionId);
-      const summaries = Array.isArray(response.schemas)
-        ? (response.schemas as Array<Record<string, unknown>>)
-        : [];
-      setDatasets(summaries.map((summary) => profileToDataset(summary)));
-    } catch (error) {
-      setSessionError(error instanceof Error ? error.message : 'Could not load the sample data.');
-    } finally {
-      setSampleLoading(false);
-    }
-  };
-
   const handleNewSession = async () => {
     if (
       (messages.length > 0 || datasets.length > 0) &&
@@ -650,8 +632,6 @@ export default function App() {
                   onSend={() => sendMessage()}
                   onSuggestion={sendMessage}
                   onUpload={handleUpload}
-                  onSampleData={handleSampleData}
-                  sampleLoading={sampleLoading}
                   inspectorOpen={inspectorOpen}
                   onToggleInspector={() => setInspectorOpen(!inspectorOpen)}
                   execution={execution}
@@ -949,8 +929,6 @@ function Chat({
   onSend,
   onSuggestion,
   onUpload,
-  onSampleData,
-  sampleLoading,
   inspectorOpen,
   onToggleInspector,
   execution,
@@ -967,8 +945,6 @@ function Chat({
   onSend: () => void;
   onSuggestion: (value: string) => void;
   onUpload: (files: File[]) => void;
-  onSampleData: () => void;
-  sampleLoading: boolean;
   inspectorOpen: boolean;
   onToggleInspector: () => void;
   execution: WorkbenchState['execution'];
@@ -1005,8 +981,6 @@ function Chat({
           <Welcome
             onSuggestion={onSuggestion}
             datasets={datasets}
-            onSampleData={onSampleData}
-            sampleLoading={sampleLoading}
           />
         ) : (
           <>
@@ -1090,13 +1064,9 @@ function Chat({
 function Welcome({
   onSuggestion,
   datasets,
-  onSampleData,
-  sampleLoading,
 }: {
   onSuggestion: (value: string) => void;
   datasets: Dataset[];
-  onSampleData: () => void;
-  sampleLoading: boolean;
 }) {
   // Suggestions reference the uploaded data once there is some, so a new user
   // sees prompts that actually apply to their file.
@@ -1116,12 +1086,6 @@ function Welcome({
         <span>Leave with clarity.</span>
       </h2>
       <p>Upload a dataset and I’ll help you explore patterns, build visualizations, and turn findings into a polished deliverable.</p>
-      {datasets.length === 0 && (
-        <button className="sample-data-button" onClick={onSampleData} disabled={sampleLoading}>
-          <Database size={15} />
-          {sampleLoading ? 'Loading sample data…' : 'Try the sample dataset'}
-        </button>
-      )}
       <div className="suggestion-grid">
         {suggestions.map(({ icon: Icon }, index) => (
           <button key={labels[index]} onClick={() => onSuggestion(labels[index])}>

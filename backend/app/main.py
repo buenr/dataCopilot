@@ -267,24 +267,6 @@ def create_app(settings: Settings | None = None, manager: SessionManager | None 
         # have to be rebuilt together.
         return {"deleted": target, "schemas": await reload_datasets(session)}
 
-    @application.post("/api/sessions/{session_id}/sample-data")
-    async def load_sample_data(session_id: str) -> dict[str, Any]:
-        """Load the bundled sample datasets so a new user can try the app
-        without having a CSV of their own handy."""
-        try:
-            session = session_manager.get(session_id)
-        except KeyError as exc:
-            raise HTTPException(404, str(exc)) from exc
-        source = Path(settings.sample_data_dir)
-        uploaded: list[str] = []
-        if source.is_dir():
-            for path in sorted(source.iterdir()):
-                if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES:
-                    await session.sandbox.upload(f"data/{path.name}", path.read_bytes())
-                    uploaded.append(f"data/{path.name}")
-        if not uploaded:
-            raise HTTPException(404, "no sample datasets are bundled with this deployment")
-        return {"files": uploaded, "schemas": await reload_datasets(session)}
 
     @application.get("/api/sessions/{session_id}/artifacts/{name:path}")
     async def download_artifact(session_id: str, name: str) -> Response:
