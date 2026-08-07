@@ -1079,13 +1079,6 @@ function Welcome({
       <div className="welcome-icon">
         <Sparkles size={25} />
       </div>
-      <span className="eyebrow">Your analytical partner</span>
-      <h2>
-        Start with a question.
-        <br />
-        <span>Leave with clarity.</span>
-      </h2>
-      <p>Upload a dataset and I’ll help you explore patterns, build visualizations, and turn findings into a polished deliverable.</p>
       <div className="suggestion-grid">
         {suggestions.map(({ icon: Icon }, index) => (
           <button key={labels[index]} onClick={() => onSuggestion(labels[index])}>
