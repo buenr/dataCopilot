@@ -172,6 +172,11 @@ sandbox (requires the sandbox image and
 make e2e
 ```
 
+`make e2e-live` adds a live-provider project that drives the same UI against
+the real OpenAI model — a PDF report first, then a dashboard — using
+`OPENAI_API_KEY` from `.env` on ports 8101/5175. It consumes API credits and
+takes several minutes per turn, so it is opt-in.
+
 ## Configuration
 
 All settings are environment-backed (see `backend/app/config.py`) and can be

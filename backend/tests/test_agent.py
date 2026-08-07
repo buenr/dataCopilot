@@ -450,6 +450,15 @@ def test_static_dashboard_preview_keeps_workspace_relative_html_path():
     assert Agent._static_preview_path("/workspace/hr_dashboard.html", command) == "hr_dashboard.html"
 
 
+def test_static_dashboard_preview_strips_absolute_workspace_subdirectory():
+    # http.server --directory re-roots the server: the preview path must be
+    # relative to that directory, not to the workspace, or the proxy 404s.
+    command = "python3 -m http.server 8501 --directory /workspace/attrition_dashboard"
+
+    assert Agent._static_preview_path("attrition_dashboard/index.html", command) == "index.html"
+    assert Agent._static_preview_path("/workspace/attrition_dashboard/index.html", command) == "index.html"
+
+
 def test_static_server_ignores_provider_runtime_directory():
     command = "python3 -m http.server 8501 --directory /home/oai/share"
 
@@ -918,6 +927,73 @@ async def test_dashboard_and_report_turn_publishes_both_artifacts(tmp_path: Path
     names = [event.get("name") for event in events if event["type"] == "artifact"]
     assert "dashboard.html" in names
     assert "report.pdf" in names
+
+
+class _SubdirectoryDashboardProvider:
+    """Serves a dashboard from a subdirectory and registers the directory name."""
+
+    async def stream(self, messages, tools):
+        tool_results = sum(1 for m in messages if m.get("role") == "tool")
+        if tool_results == 0:
+            yield {
+                "tool": "run_python",
+                "arguments": {
+                    "code": (
+                        "from pathlib import Path\n"
+                        "site = Path(WORKSPACE) / 'site'\n"
+                        "site.mkdir(exist_ok=True)\n"
+                        "(site / 'index.html').write_text('<!doctype html><p>4 rows</p>')"
+                    )
+                },
+                "call_id": "c1",
+            }
+        elif tool_results == 1:
+            yield {
+                "tool": "start_webapp",
+                "arguments": {
+                    "command": "python3 -m http.server 8501 --directory /workspace/site",
+                    "port": 8501,
+                },
+                "call_id": "c2",
+            }
+        elif tool_results == 2:
+            yield {
+                "tool": "register_artifact",
+                "arguments": {"name": "site", "type": "webapp", "port": 8501},
+                "call_id": "c3",
+            }
+        else:
+            yield "The dashboard is live."
+
+
+@pytest.mark.asyncio
+async def test_dashboard_registered_by_directory_publishes_served_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The live OpenAI model did exactly this: register_artifact with the
+    served directory name returned no artifacts, so nothing published until
+    recovery stepped in — with a workspace-relative path that 404s behind a
+    server rooted at the subdirectory."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    sandbox = FakeSandbox("subdir", workspace)
+
+    async def fake_start_webapp(command: str, port: int) -> int:
+        sandbox.preview_ports[port] = port
+        return port
+
+    monkeypatch.setattr(sandbox, "start_webapp", fake_start_webapp)
+    agent = Agent(sandbox, _SubdirectoryDashboardProvider(), "subdir", tmp_path / "sessions")
+
+    try:
+        events = [event async for event in agent.turn("Build a dashboard")]
+    finally:
+        await sandbox.close()
+
+    artifacts = [event for event in events if event["type"] == "artifact"]
+    assert len(artifacts) == 1
+    assert artifacts[0]["path"] == "index.html"
+    assert artifacts[0]["port"] == 8501
 
 
 class _BadReadProvider:

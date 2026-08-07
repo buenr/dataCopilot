@@ -24,3 +24,8 @@ smoke:
 # with real Docker sandboxes. Starts its own servers on ports 8100/5174.
 e2e:
 	cd frontend && npm run test:e2e
+
+# Same suite plus a live-provider run against the real OpenAI model
+# (consumes API credits; reads OPENAI_API_KEY from .env).
+e2e-live:
+	cd frontend && E2E_LIVE=1 npm run test:e2e

@@ -140,7 +140,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "register_artifact",
-            "description": "Register a generated HTML, PDF, image, or other artifact for the canvas.",
+            "description": "Register a generated HTML, PDF, image, or other artifact for the canvas. "
+            "For a webapp, register the served HTML file (for example dashboard.html or site/index.html).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -692,7 +693,22 @@ class ToolDispatcher:
         elif name == "register_artifact":
             artifacts = await self.sandbox.artifacts()
             requested = arguments.get("name")
+            requested = _workspace_relative(requested).rstrip("/") if requested else None
             selected = [a for a in artifacts if not requested or a.get("name") == requested]
+            if requested and not selected:
+                # Models sometimes register the directory they serve (for
+                # example attrition_dashboard/) instead of the HTML page inside
+                # it; resolve the directory to its served page so the canvas
+                # still receives the artifact.
+                prefix = requested + "/"
+                nested = [a for a in artifacts if str(a.get("path", "")).startswith(prefix)]
+                served = next((a for a in nested if a.get("name") == "index.html"), None)
+                if served is None:
+                    served = next(
+                        (a for a in nested if str(a.get("path", "")).lower().endswith(".html")),
+                        None,
+                    )
+                selected = [served] if served is not None else []
             for artifact in selected:
                 if arguments.get("port"):
                     artifact["port"] = int(arguments["port"])
@@ -1195,9 +1211,20 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
             return None
         directory = _http_server_directory(command)
         if directory:
-            prefix = directory.rstrip("/\\") + "/"
-            if html_path.startswith(prefix):
-                return html_path[len(prefix):]
+            # html_path is usually workspace-relative while --directory often
+            # names the served root absolutely (for example
+            # --directory /workspace/attrition_dashboard); compare both in
+            # workspace-relative form so the preview path is relative to the
+            # server's document root instead of 404ing behind the proxy.
+            relative_dir = _workspace_relative(directory).strip("/\\")
+            normalized = _workspace_relative(html_path)
+            if relative_dir in {"", ".", "workspace"}:
+                # Serving the workspace root: the relative path already matches
+                # the server's document root.
+                return normalized
+            prefix = relative_dir + "/"
+            if normalized.startswith(prefix):
+                return normalized[len(prefix):]
         return html_path
 
     async def _dispatch(
