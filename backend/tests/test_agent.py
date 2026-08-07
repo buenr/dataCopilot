@@ -945,3 +945,36 @@ async def test_tool_failure_returns_error_result_instead_of_killing_turn(tmp_pat
     assert any(event["type"] == "assistant_message" for event in events)
     assert not any(event["type"] == "error" for event in events)
     assert events[-1]["type"] == "done"
+
+
+class _DashboardOnlyProvider:
+    """Registers just the dashboard on a combined dashboard+report prompt."""
+
+    async def stream(self, messages, tools):
+        if any(m.get("role") == "tool" for m in messages):
+            yield "Dashboard done."
+            return
+        yield {
+            "tool": "register_artifact",
+            "arguments": {"name": "dashboard.html", "type": "webapp", "port": 8501},
+            "call_id": "c1",
+        }
+
+
+@pytest.mark.asyncio
+async def test_combined_turn_still_recovers_missing_pdf(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "dashboard.html").write_text("<!doctype html><p>data</p>")
+    sandbox = FakeSandbox("combo", workspace)
+    agent = Agent(sandbox, _DashboardOnlyProvider(), "combo", tmp_path / "sessions")
+
+    try:
+        events = [event async for event in agent.turn("Build a dashboard and write a PDF report")]
+    finally:
+        await sandbox.close()
+
+    names = [event.get("name") for event in events if event["type"] == "artifact"]
+    assert "dashboard.html" in names
+    # Publishing the dashboard must not suppress the PDF recovery.
+    assert any(str(name).endswith(".pdf") for name in names)

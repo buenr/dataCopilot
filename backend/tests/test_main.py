@@ -320,6 +320,7 @@ def test_session_resume_restores_registered_artifact_metadata(tmp_path: Path):
         (workspace / "dashboard.html").write_text("<!doctype html>")
         (workspace / "report.pdf").write_bytes(b"%PDF-1.4 fake")
         (workspace / "chart.png").write_bytes(b"\x89PNG fake")
+        (workspace / "recovered.html").write_text("<!doctype html>")
         # The sandbox scan reports name/path/size only; the trajectory remembers
         # the type and port the model declared for each artifact.
         trajectory = tmp_path / "sessions" / session_id / "trajectory.jsonl"
@@ -360,6 +361,19 @@ def test_session_resume_restores_registered_artifact_metadata(tmp_path: Path):
                             },
                         }
                     ),
+                    # The dashboard recovery path records its own event rather
+                    # than a register_artifact tool result.
+                    json.dumps(
+                        {
+                            "type": "artifact_recovered",
+                            "artifact": {
+                                "name": "recovered.html",
+                                "path": "recovered.html",
+                                "port": 8502,
+                                "type": "webapp",
+                            },
+                        }
+                    ),
                 ]
             )
             + "\n"
@@ -371,11 +385,13 @@ def test_session_resume_restores_registered_artifact_metadata(tmp_path: Path):
             assert artifacts["dashboard.html"]["type"] == "webapp"
             assert artifacts["dashboard.html"]["port"] == 8501
             assert artifacts["report.pdf"]["type"] == "pdf"
+            assert artifacts["recovered.html"]["type"] == "webapp"
+            assert artifacts["recovered.html"]["port"] == 8502
             # An unregistered scan hit still lands on a sensible tab.
             assert artifacts["chart.png"]["type"] == "image"
             # Registered artifacts replay last so the canvas re-selects the
             # artifact the user was looking at.
-            assert ready["artifacts"][-1]["name"] == "report.pdf"
+            assert ready["artifacts"][-1]["name"] == "recovered.html"
 
 
 @pytest.mark.asyncio

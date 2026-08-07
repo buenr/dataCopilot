@@ -185,12 +185,21 @@ def _restored_artifacts(
     """Merge the sandbox artifact scan with what the run actually registered.
 
     The scan only reports name/path/size; the trajectory's register_artifact
-    results remember the declared type and port, which the canvas needs to
-    render a web app after a reconnect. Unregistered files get a type inferred
-    from their extension so they still land on a sensible tab. Registered
-    artifacts come last so the replay re-selects what the user last saw.
+    results and artifact_recovered events remember the declared type and port,
+    which the canvas needs to render a web app after a reconnect. Unregistered
+    files get a type inferred from their extension so they still land on a
+    sensible tab. Registered artifacts come last so the replay re-selects what
+    the user last saw.
     """
     registered: dict[str, dict[str, Any]] = {}
+
+    def remember(artifact: Any) -> None:
+        if not isinstance(artifact, dict) or not artifact.get("name"):
+            return
+        name = str(artifact["name"])
+        merged = {k: v for k, v in artifact.items() if v is not None}
+        registered[name] = {**registered.get(name, {}), **merged}
+
     trajectory = sessions_dir / session_id / "trajectory.jsonl"
     try:
         for line in trajectory.read_text(encoding="utf-8").splitlines():
@@ -198,11 +207,11 @@ def _restored_artifacts(
                 event = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if event.get("type") != "tool_result" or event.get("tool") != "register_artifact":
-                continue
-            for artifact in (event.get("result") or {}).get("artifacts") or []:
-                if isinstance(artifact, dict) and artifact.get("name"):
-                    registered[str(artifact["name"])] = artifact
+            if event.get("type") == "tool_result" and event.get("tool") == "register_artifact":
+                for artifact in (event.get("result") or {}).get("artifacts") or []:
+                    remember(artifact)
+            elif event.get("type") == "artifact_recovered":
+                remember(event.get("artifact"))
     except OSError:
         pass
     inferred = {".pdf": "pdf", ".png": "image", ".jpg": "image", ".jpeg": "image", ".svg": "image"}

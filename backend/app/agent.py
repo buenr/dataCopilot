@@ -1227,7 +1227,10 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
             final_text = ""
             dashboard_request = self._is_dashboard_request(content)
             report_request = self._is_report_request(content)
-            renderable_artifact = False
+            # Tracked per category so a combined dashboard+report turn gates each
+            # recovery path below on its own artifact kind.
+            published_pdf = False
+            published_webapp = False
             started_ports: dict[int, str] = {}
             all_text: list[str] = []
             run_python_outputs: list[str] = []
@@ -1309,13 +1312,6 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
                         started_ports.pop(int(tool_result["port"]), None)
                     if item["tool"] == "register_artifact" and "artifacts" in tool_result:
                         artifacts = tool_result["artifacts"]
-                        if report_request:
-                            renderable_artifact = any(
-                                self._is_pdf_artifact(artifact)
-                                for artifact in artifacts
-                            ) or renderable_artifact
-                        elif not dashboard_request:
-                            renderable_artifact = bool(artifacts) or renderable_artifact
                         for artifact in artifacts:
                             is_webapp = bool(
                                 artifact.get("type") == "webapp" and artifact.get("port")
@@ -1358,8 +1354,10 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
                                         # A read hiccup says nothing about the
                                         # dashboard's content; still publish it.
                                         pass
-                            if dashboard_request and is_webapp:
-                                renderable_artifact = True
+                            if is_webapp:
+                                published_webapp = True
+                            if is_pdf:
+                                published_pdf = True
                             yield {
                                 "type": "artifact",
                                 "name": artifact.get("name"),
@@ -1398,7 +1396,7 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
                             "content": json.dumps(result, default=str),
                         }
                     )
-            if report_request and not renderable_artifact:
+            if report_request and not published_pdf:
                 fallback_content = "\n\n".join(all_text or run_python_outputs)
                 if not fallback_content:
                     # The provider hit the step cap without saying anything;
@@ -1428,7 +1426,7 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
                         f"canvas: {recovery_error}."
                     )
                     final_text = f"{final_text}\n\n{notice}" if final_text else notice
-            if dashboard_request and not renderable_artifact:
+            if dashboard_request and not published_webapp:
                 recovered, recovery_error = await self._recover_dashboard_artifact(
                     started_ports,
                     dataset_profiles,
