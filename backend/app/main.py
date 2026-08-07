@@ -175,7 +175,11 @@ def make_provider(settings: Settings) -> Any:
     if provider == "openai":
         if not settings.openai_api_key:
             raise RuntimeError("LLM_PROVIDER=openai requires OPENAI_API_KEY")
-        return OpenAIProvider(settings.openai_api_key, settings.openai_model)
+        return OpenAIProvider(
+            settings.openai_api_key,
+            settings.openai_model,
+            settings.openai_reasoning_effort,
+        )
     return MockProvider()
 
 

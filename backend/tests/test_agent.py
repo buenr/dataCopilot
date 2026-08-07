@@ -2,9 +2,12 @@ from pathlib import Path
 
 from pathlib import Path
 
+import sys
+import types
+
 import pytest
 
-from app.agent import PDF_RESCUE_CODE, Agent, AnthropicProvider, MockProvider, ToolDispatcher
+from app.agent import PDF_RESCUE_CODE, Agent, AnthropicProvider, MockProvider, OpenAIProvider, ToolDispatcher
 from app.sandbox import FakeSandbox
 
 
@@ -837,3 +840,49 @@ async def test_mock_chart_request_registers_image_artifact(tmp_path: Path):
     svg = (tmp_path / "workspace" / "chart.svg").read_text()
     assert svg.startswith("<svg")
     assert "revenue" in svg
+
+
+class _EmptyStream:
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raise StopAsyncIteration
+
+
+class _FakeResponsesAPI:
+    """Captures Responses API requests and returns an empty stream."""
+
+    def __init__(self) -> None:
+        self.requests: list[dict] = []
+
+    async def create(self, **request):
+        self.requests.append(request)
+        return _EmptyStream()
+
+
+def _install_fake_openai(monkeypatch) -> _FakeResponsesAPI:
+    fake = _FakeResponsesAPI()
+    module = types.SimpleNamespace(AsyncOpenAI=lambda api_key: types.SimpleNamespace(responses=fake))
+    monkeypatch.setitem(sys.modules, "openai", module)
+    return fake
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_sends_reasoning_effort(monkeypatch):
+    fake = _install_fake_openai(monkeypatch)
+    provider = OpenAIProvider("key", "gpt-5.6-luna", reasoning_effort="xhigh")
+
+    _ = [item async for item in provider.stream([{"role": "user", "content": "hi"}], [])]
+
+    assert fake.requests[0]["reasoning"] == {"effort": "xhigh"}
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_omits_reasoning_by_default(monkeypatch):
+    fake = _install_fake_openai(monkeypatch)
+    provider = OpenAIProvider("key", "gpt-5.6-luna")
+
+    _ = [item async for item in provider.stream([{"role": "user", "content": "hi"}], [])]
+
+    assert "reasoning" not in fake.requests[0]

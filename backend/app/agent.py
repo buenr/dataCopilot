@@ -450,8 +450,11 @@ class AnthropicProvider:
 
 
 class OpenAIProvider:
-    def __init__(self, api_key: str, model: str):
+    def __init__(self, api_key: str, model: str, reasoning_effort: str = ""):
         self.api_key, self.model = api_key, model
+        # e.g. gpt-5.6-luna supports none/low/medium/high/xhigh/max; empty
+        # means the model's own default (high on luna).
+        self.reasoning_effort = reasoning_effort.strip().lower()
 
     async def stream(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> AsyncIterator[str | dict[str, Any]]:
         try:
@@ -468,6 +471,8 @@ class OpenAIProvider:
             "messages": messages,
             "stream": True,
         }
+        if self.reasoning_effort:
+            request["reasoning_effort"] = self.reasoning_effort
         if tools:
             request["tools"] = tools
             request["tool_choice"] = "auto"
@@ -553,6 +558,8 @@ class OpenAIProvider:
             "input": input_items,
             "stream": True,
         }
+        if self.reasoning_effort:
+            request["reasoning"] = {"effort": self.reasoning_effort}
         if system:
             request["instructions"] = system
         if response_tools:
