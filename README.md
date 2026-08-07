@@ -131,7 +131,8 @@ Equivalent `make` targets are available: `make install`, `make backend`,
 
 ## Demo
 
-1. Upload `sample_data/sales.csv` from the left explorer.
+1. Upload `sample_data/WA_Fn-UseC_-HR-Employee-Attrition.csv` from the left
+   explorer.
 2. Ask **Build a dashboard**.
 3. Ask **Create a PDF whitepaper report**.
 4. Inspect the generated results through the canvas tabs and the execution
@@ -152,8 +153,8 @@ placed in `.env`:
 | --- | --- | --- |
 | `LLM_PROVIDER` | `mock` | Agent backend: `mock`, `anthropic`, or `openai` |
 | `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | empty | Provider credentials |
-| `ANTHROPIC_MODEL` | `claude-3-5-sonnet-latest` | Anthropic model identifier |
-| `OPENAI_MODEL` | `gpt-4o-mini` | OpenAI model identifier |
+| `ANTHROPIC_MODEL` | `claude-sonnet-5` | Anthropic model identifier |
+| `OPENAI_MODEL` | `gpt-5.6` | OpenAI model identifier |
 | `BACKEND_HOST` / `BACKEND_PORT` | `0.0.0.0` / `8000` | Gateway bind address |
 | `FRONTEND_ORIGIN` | `http://localhost:5173,...` | Comma-separated CORS origins |
 | `SESSION_TTL_MINUTES` | `30` | Idle session lifetime before reaping |

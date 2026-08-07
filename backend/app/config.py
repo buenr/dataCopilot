@@ -20,8 +20,8 @@ class Settings(BaseSettings):
     llm_provider: str = "mock"
     anthropic_api_key: str = Field(default="", repr=False)
     openai_api_key: str = Field(default="", repr=False)
-    anthropic_model: str = "claude-3-5-sonnet-latest"
-    openai_model: str = "gpt-4o-mini"
+    anthropic_model: str = "claude-sonnet-5"
+    openai_model: str = "gpt-5.6"
     sessions_dir: str = "sessions"
 
     model_config = SettingsConfigDict(
