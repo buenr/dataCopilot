@@ -2,7 +2,6 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
-
 from app.profiling import profile_dataframe, profile_files
 
 

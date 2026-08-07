@@ -6,11 +6,9 @@ import asyncio
 import io
 import json
 import os
-import shlex
 import socket
 import subprocess
 import time
-import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -73,7 +71,8 @@ class Kernel:
                 output, errors = io.StringIO(), io.StringIO()
                 try:
                     with redirect_stdout(output), redirect_stderr(errors):
-                        exec(code, self.fallback_globals, self.fallback_globals)
+                        # Kernel fallback: sandboxd exists to execute agent code.
+                        exec(code, self.fallback_globals, self.fallback_globals)  # nosemgrep: python.lang.security.audit.exec-detected.exec-detected
                 except Exception as exc:
                     errors.write(f"{type(exc).__name__}: {exc}")
                 events = []
@@ -195,7 +194,8 @@ async def health() -> dict[str, Any]:
 
 @app.post("/exec")
 async def execute(request: ExecRequest) -> dict[str, Any]:
-    return await kernel.execute(request.code)
+    # This is the IPython kernel's execute, not a DB cursor — semgrep matches the name.
+    return await kernel.execute(request.code)  # nosemgrep: python.django.security.injection.sql.sql-injection-using-db-cursor-execute.sql-injection-db-cursor-execute
 
 
 @app.post("/exec/stream")
@@ -301,7 +301,9 @@ async def process(request: ProcessRequest) -> dict[str, Any]:
     if request.action == "start":
         if not request.command or not request.port:
             raise HTTPException(400, "command and port are required")
-        child = subprocess.Popen(request.command, shell=True, cwd=WORKSPACE, start_new_session=True)
+        # Running agent-supplied commands is this service's purpose; Popen itself
+        # returns immediately, so the event loop is not blocked here.
+        child = subprocess.Popen(request.command, shell=True, cwd=WORKSPACE, start_new_session=True)  # noqa: ASYNC220  # nosemgrep: python.django.security.injection.command.subprocess-injection.subprocess-injection, python.lang.security.audit.subprocess-shell-true.subprocess-shell-true
         processes[request.port] = child
         try:
             await asyncio.to_thread(wait_for_port, child, request.port)

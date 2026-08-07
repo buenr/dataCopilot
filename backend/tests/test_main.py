@@ -4,7 +4,6 @@ from pathlib import Path
 
 import httpx
 import pytest
-
 from app.config import Settings
 from app.main import cors_origins, create_app
 from app.sandbox import FakeSandbox, SessionManager

@@ -248,3 +248,24 @@ docker build -t data-copilot-sandbox:latest sandbox
 Backend tests run against `FakeSandbox` and require no Docker daemon. The
 smoke test exercises the real Docker-backed session: upload and profiling,
 dashboard preview, PDF download, and cleanup.
+
+`make lint` runs the same static gates as CI: ruff (lint), ty (types, scoped
+to `backend`/`scripts`), bandit (medium severity and up on `backend/app` and
+`scripts`), and semgrep (`p/python` + `p/security-audit`, needs network for
+the registry rulesets). By-design findings — the sandbox executing agent code,
+the gateway binding all interfaces — carry inline `# noqa` / `# nosec` /
+`# nosemgrep` justifications instead of blanket rule disables.
+
+## CI
+
+`.github/workflows/ci.yml` runs on every pull request and push to `main`/`develop`:
+
+- **python** — ruff, ty, bandit, and pytest via `uv sync --locked`
+- **frontend** — `npm ci`, typecheck, and production build
+- **security** — semgrep plus a full-history gitleaks secret scan
+- **actionlint** — lints the workflow files themselves
+- **e2e** — the Playwright suite against real Docker sandboxes; nightly and
+  manual only, too slow for PR gating
+
+Third-party actions and images are pinned by commit SHA or digest. Merging to
+`main` requires the four fast checks to pass (branch protection).

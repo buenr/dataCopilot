@@ -5,14 +5,13 @@ from __future__ import annotations
 import asyncio
 import io
 import json
-import os
 import subprocess
-import threading
 import time
 import uuid
-from collections.abc import Callable
-from contextlib import redirect_stderr, redirect_stdout
+from collections.abc import Awaitable, Callable
+from contextlib import redirect_stderr, redirect_stdout, suppress
 from dataclasses import dataclass, field
+from datetime import UTC
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -66,7 +65,9 @@ class FakeSandbox:
         try:
             with redirect_stdout(output), redirect_stderr(errors):
                 compiled = compile(code, "<sandbox>", "exec")
-                exec(compiled, self._globals, self._globals)
+                # The fake sandbox's whole job is executing agent code inline;
+                # it is only used for local development and tests.
+                exec(compiled, self._globals, self._globals)  # nosec B102  # nosemgrep: python.lang.security.audit.exec-detected.exec-detected
         except Exception as exc:  # stderr is intentionally returned to agent for retry
             errors.write(f"{type(exc).__name__}: {exc}")
         events: list[dict[str, Any]] = []
@@ -115,7 +116,9 @@ class FakeSandbox:
         ]
 
     async def start_webapp(self, command: str, port: int) -> int:
-        process = subprocess.Popen(command, shell=True, cwd=self.root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Dev/test-only mock: Popen returns immediately, and the command comes from
+        # the local agent loop rather than a remote caller.
+        process = subprocess.Popen(command, shell=True, cwd=self.root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)  # noqa: ASYNC220  # nosec B602  # nosemgrep: python.lang.security.audit.subprocess-shell-true.subprocess-shell-true
         self._processes[port] = process
         self.preview_ports[port] = port
         return port
@@ -182,7 +185,7 @@ class DockerSandbox:
         self._base_url = f"http://{preview_host}:{preview_ports[7000]}"
 
     @classmethod
-    def create(cls, session_id: str, settings: Any, docker_client: Any | None = None) -> "DockerSandbox":
+    def create(cls, session_id: str, settings: Any, docker_client: Any | None = None) -> DockerSandbox:
         try:
             if docker_client is None:
                 try:
@@ -229,7 +232,8 @@ class DockerSandbox:
                 pids_limit=512,
                 cap_drop=["ALL"],
                 security_opt=["no-new-privileges:true"],
-                tmpfs={"/tmp": "rw,noexec,nosuid,size=512m"},
+                # Hardened in-container tmpfs, not a host temp dir.
+                tmpfs={"/tmp": "rw,noexec,nosuid,size=512m"},  # nosec B108
                 network=network_name,
                 environment={"SANDBOX_ALLOW_EGRESS": str(settings.sandbox_allow_egress).lower()},
             )
@@ -252,14 +256,10 @@ class DockerSandbox:
             # A partial provision must not leak the container or the
             # per-session volume (previously only wait_ready failures cleaned up).
             if container is not None:
-                try:
+                with suppress(Exception):
                     container.remove(force=True)
-                except Exception:
-                    pass
-            try:
+            with suppress(Exception):
                 client.volumes.get(volume_name).remove()
-            except Exception:
-                pass
             raise
         return sandbox
 
@@ -302,31 +302,33 @@ class DockerSandbox:
         # No read timeout: output arrives as the cell runs, and a long silent
         # computation is bounded by sandboxd's own per-message kernel timeout.
         timeout = httpx.Timeout(None, connect=10.0)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            async with client.stream("POST", self._base_url + "/exec/stream", json={"code": code}) as response:
-                response.raise_for_status()
-                async for line in response.aiter_lines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        event = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if event.get("type") == "summary":
-                        summary = event.get("result", {})
-                        continue
-                    events.append(event)
-                    data = event.get("data")
-                    if isinstance(data, str) and data:
-                        kind = event.get("type")
-                        if kind == "stderr":
-                            stderr.append(data)
-                        elif kind == "stdout":
-                            stdout.append(data)
-                        # `result` reprs are worth showing live but are not stdout,
-                        # matching how the buffered endpoint reports them.
-                        on_event(event)
+        async with (
+            httpx.AsyncClient(timeout=timeout) as client,
+            client.stream("POST", self._base_url + "/exec/stream", json={"code": code}) as response,
+        ):
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") == "summary":
+                    summary = event.get("result", {})
+                    continue
+                events.append(event)
+                data = event.get("data")
+                if isinstance(data, str) and data:
+                    kind = event.get("type")
+                    if kind == "stderr":
+                        stderr.append(data)
+                    elif kind == "stdout":
+                        stdout.append(data)
+                    # `result` reprs are worth showing live but are not stdout,
+                    # matching how the buffered endpoint reports them.
+                    on_event(event)
         return Execution(
             stdout=summary.get("stdout", "".join(stdout)),
             stderr=summary.get("stderr", "".join(stderr)),
@@ -401,22 +403,28 @@ class ManagedSession:
 
 
 class SessionManager:
-    def __init__(self, settings: Any, sandbox_factory: Any | None = None):
+    def __init__(
+        self,
+        settings: Any,
+        sandbox_factory: Callable[[str], Sandbox | Awaitable[Sandbox]] | None = None,
+    ):
         self.settings = settings
         self.sandbox_factory = sandbox_factory or (lambda sid: DockerSandbox.create(sid, settings))
         self.sessions: dict[str, ManagedSession] = {}
         self._lock = asyncio.Lock()
 
     async def create(self) -> ManagedSession:
-        from datetime import datetime, timezone
+        from datetime import datetime
         sid = str(uuid.uuid4())
         # Provisioning blocks on the Docker SDK (container start plus kernel
         # health polling can take many seconds); keep it off the event loop so
         # one session creation cannot stall every other session.
         sandbox = await asyncio.to_thread(self.sandbox_factory, sid)
-        if asyncio.iscoroutine(sandbox):
+        # Tests can inject an async factory; isinstance narrows any awaitable,
+        # not just coroutines, so the session always ends up with a Sandbox.
+        if isinstance(sandbox, Awaitable):
             sandbox = await sandbox
-        session = ManagedSession(sid, sandbox, datetime.now(timezone.utc).isoformat(), asyncio.get_running_loop().time())
+        session = ManagedSession(sid, sandbox, datetime.now(UTC).isoformat(), asyncio.get_running_loop().time())
         async with self._lock:
             self.sessions[sid] = session
         return session

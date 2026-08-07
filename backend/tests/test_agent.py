@@ -1,13 +1,16 @@
-from pathlib import Path
-
-from pathlib import Path
-
 import sys
 import types
+from pathlib import Path
 
 import pytest
-
-from app.agent import PDF_RESCUE_CODE, Agent, AnthropicProvider, MockProvider, OpenAIProvider, ToolDispatcher
+from app.agent import (
+    PDF_RESCUE_CODE,
+    Agent,
+    AnthropicProvider,
+    MockProvider,
+    OpenAIProvider,
+    ToolDispatcher,
+)
 from app.sandbox import FakeSandbox
 
 

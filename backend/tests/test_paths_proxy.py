@@ -1,5 +1,4 @@
 import pytest
-
 from app.paths import UnsafePath, safe_path
 from app.proxy import parse_preview_path, preview_target
 

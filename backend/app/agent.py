@@ -7,10 +7,11 @@ import html
 import json
 import re
 import shlex
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Protocol
+from typing import Any, Protocol
 
 from .sandbox import EventCallback, Execution, Sandbox
 
@@ -251,7 +252,10 @@ def mock_executive_summary(messages: list[dict[str, Any]]) -> str:
 
 
 class LLMProvider(Protocol):
-    async def stream(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> AsyncIterator[str | dict[str, Any]]: ...
+    # Implementations are async generator functions, so a call returns the
+    # AsyncIterator directly; declaring `async def` here would type the call
+    # as a coroutine and mislead both checkers and future implementations.
+    def stream(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> AsyncIterator[str | dict[str, Any]]: ...
 
 
 class MockProvider:
@@ -413,9 +417,12 @@ class AnthropicProvider:
             final = await stream.get_final_message()
         for block in final.content:
             if getattr(block, "type", None) == "tool_use":
+                # Only ToolUseBlock carries input; getattr keeps this safe across
+                # the SDK's growing union of content block types.
+                arguments = getattr(block, "input", {})
                 yield {
                     "tool": getattr(block, "name", ""),
-                    "arguments": block.input if isinstance(block.input, dict) else {},
+                    "arguments": arguments if isinstance(arguments, dict) else {},
                     "call_id": getattr(block, "id", ""),
                 }
 
@@ -611,7 +618,7 @@ class ToolDispatcher:
         self.trajectory_path.parent.mkdir(parents=True, exist_ok=True)
 
     def record(self, event: dict[str, Any]) -> None:
-        event = {"timestamp": datetime.now(timezone.utc).isoformat(), **event}
+        event = {"timestamp": datetime.now(UTC).isoformat(), **event}
         with self.trajectory_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, default=str) + "\n")
 
@@ -745,7 +752,7 @@ class Agent:
     ):
         self.provider = provider
         self.dispatcher = ToolDispatcher(sandbox, session_id, Path(sessions_dir))
-        self.dataset_context = dataset_context or (lambda: [])
+        self.dataset_context = dataset_context or (list)
         # A caller can own the transcript (the gateway keeps it on the session) so
         # conversation memory survives a reconnect, which builds a new Agent.
         self.messages: list[dict[str, Any]] = history if history is not None else []
@@ -1061,7 +1068,7 @@ print("Fallback PDF written")
         profiles: list[dict[str, Any]],
     ) -> bool:
         """Require concrete profile values outside scripts and styles."""
-        visible = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", content, flags=re.I | re.S)
+        visible = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", content, flags=re.IGNORECASE | re.DOTALL)
         visible = re.sub(r"<[^>]+>", " ", visible)
         visible = html.unescape(visible).lower()
         if not visible.strip():
@@ -1283,7 +1290,7 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
                         text_parts.append(item)
                         yield {"type": "assistant_delta", "content": item}
                         continue
-                    tool_id = f"tool-{datetime.now(timezone.utc).timestamp():.6f}"
+                    tool_id = f"tool-{datetime.now(UTC).timestamp():.6f}"
                     provider_call_id = str(item.get("call_id", tool_id))
                     arguments = item.get("arguments", {})
                     yield {
@@ -1362,9 +1369,7 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
                             if dashboard_request and report_request:
                                 if not (is_webapp or is_pdf):
                                     continue
-                            elif dashboard_request and not is_webapp:
-                                continue
-                            elif report_request and not is_pdf:
+                            elif dashboard_request and not is_webapp or report_request and not is_pdf:
                                 continue
                             artifact = dict(artifact)
                             if report_request and is_pdf:

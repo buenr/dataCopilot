@@ -1,4 +1,4 @@
-.PHONY: install backend frontend test build-sandbox smoke e2e
+.PHONY: install backend frontend test lint build-sandbox smoke e2e
 
 install:
 	uv sync
@@ -13,6 +13,14 @@ frontend:
 test:
 	uv run pytest -q
 	cd frontend && npm run typecheck
+
+# Same gates as CI (.github/workflows/ci.yml). Semgrep fetches its rulesets
+# from the registry, so this target needs network access.
+lint:
+	uv run ruff check .
+	uv run ty check backend scripts
+	uv run bandit -r backend/app scripts -ll -q
+	uv run semgrep scan --config p/python --config p/security-audit backend sandbox scripts --error --quiet --metrics=off
 
 build-sandbox:
 	docker build -t $${SANDBOX_IMAGE:-data-copilot-sandbox:latest} sandbox
