@@ -19,6 +19,7 @@ import {
   Gauge,
   Globe2,
   HardDriveUpload,
+  Image,
   LayoutPanelLeft,
   Maximize2,
   Minimize2,
@@ -43,6 +44,7 @@ import {
   deleteDataset,
   deleteSession,
   getSession,
+  loadSampleData,
   uploadDataset,
   websocketUrl,
 } from './lib/api';
@@ -190,9 +192,14 @@ export default function App() {
   } = useWorkbench();
   const socketRef = useRef<WebSocket | null>(null);
   const intentionalCloseRef = useRef(false);
+  // Follow-up typed while a run is active; sent when the run finishes.
+  const pendingMessageRef = useRef<string | null>(null);
+  // Set when the socket reports a reaped session so the fresh one can say so.
+  const sessionExpiredRef = useRef(false);
   const [draft, setDraft] = useState('');
   const [sessionError, setSessionError] = useState('');
   const [uploading, setUploading] = useState(false);
+  const [sampleLoading, setSampleLoading] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [dragOver, setDragOver] = useState(false);
   const [sessionKey, setSessionKey] = useState(0);
@@ -228,6 +235,16 @@ export default function App() {
         wb.updateExecution({ stdout: '', stderr: '', code: '', variables: [], running: false });
         wb.setThinking(false);
         wb.setTurnActive(false);
+        if (sessionExpiredRef.current) {
+          // The old session was reaped and this socket belongs to a fresh one.
+          sessionExpiredRef.current = false;
+          wb.addMessage({
+            id: newId('system'),
+            role: 'system',
+            content: 'Your previous session expired after inactivity — a fresh session has started.',
+            timestamp: Date.now(),
+          });
+        }
         break;
       }
       case 'assistant_delta':
@@ -260,6 +277,9 @@ export default function App() {
             payload.error ? 'error' : 'complete',
             payload.error ? textValue(payload.error) : undefined,
           );
+        // The LLM is composing its next step now; keeping the indicator alive
+        // avoids a frozen-looking gap between tool result and next delta.
+        wb.setThinking(true);
         break;
       }
       case 'execution': {
@@ -312,28 +332,63 @@ export default function App() {
           content: textValue(payload.message, 'Run stopped.'),
           timestamp: Date.now(),
         });
-        wb.updateExecution({ running: false });
-        wb.setThinking(false);
-        wb.setTurnActive(false);
-        break;
-      case 'error':
-        wb.setConnection('error');
-        wb.addMessage({
-          id: newId('error'),
-          role: 'system',
-          content: textValue(payload.message ?? payload.error, 'The gateway returned an error.'),
-          timestamp: Date.now(),
-        });
-        wb.updateExecution({ running: false });
-        wb.setThinking(false);
-        wb.setTurnActive(false);
-        break;
-      case 'done':
         wb.finishAssistant();
         wb.updateExecution({ running: false });
         wb.setThinking(false);
         wb.setTurnActive(false);
+        // A stopped run should not fire a queued follow-up; hand it back.
+        if (pendingMessageRef.current) {
+          setDraft(pendingMessageRef.current);
+          pendingMessageRef.current = null;
+        }
         break;
+      case 'error': {
+        const errorText = textValue(payload.message ?? payload.error, 'The gateway returned an error.');
+        // Rejected because a turn is already running: that turn is still alive,
+        // so its state must not be torn down here.
+        if (errorText.includes('already in progress')) break;
+        // A reaped session is handled by the 4404 close handler, which starts
+        // fresh and explains what happened; the raw message adds nothing.
+        if (!errorText.includes('session not found')) {
+          wb.addMessage({
+            id: newId('error'),
+            role: 'system',
+            content: errorText,
+            timestamp: Date.now(),
+          });
+        }
+        // Agent errors are not connection failures; socket state is owned by
+        // onopen/onclose, so the connection indicator is left untouched here.
+        wb.finishAssistant();
+        wb.updateExecution({ running: false });
+        wb.setThinking(false);
+        wb.setTurnActive(false);
+        if (pendingMessageRef.current) {
+          setDraft(pendingMessageRef.current);
+          pendingMessageRef.current = null;
+        }
+        break;
+      }
+      case 'done': {
+        wb.finishAssistant();
+        wb.updateExecution({ running: false });
+        wb.setThinking(false);
+        wb.setTurnActive(false);
+        const queued = pendingMessageRef.current;
+        if (queued && socketRef.current?.readyState === WebSocket.OPEN) {
+          // Send the follow-up queued while the previous run was working.
+          pendingMessageRef.current = null;
+          wb.addMessage({ id: newId('user'), role: 'user', content: queued, timestamp: Date.now() });
+          wb.clearTools();
+          wb.setThinking(true);
+          wb.setTurnActive(true);
+          socketRef.current.send(JSON.stringify({ type: 'user_message', content: queued }));
+        } else if (queued) {
+          pendingMessageRef.current = null;
+          setDraft(queued);
+        }
+        break;
+      }
       default:
         break;
     }
@@ -388,10 +443,18 @@ export default function App() {
       socket.onerror = () => {
         if (!disposed && socketRef.current === socket) setConnection('error');
       };
-      socket.onclose = () => {
+      socket.onclose = (closeEvent) => {
         if (disposed || socketRef.current !== socket) return;
         setConnection('offline');
         if (intentionalCloseRef.current) return;
+        if (closeEvent.code === 4404) {
+          // The session was reaped (idle TTL) or never existed. Reconnecting to
+          // the same id would loop "session not found" forever, so start fresh.
+          sessionStorage.removeItem('datacopilot-session-id');
+          sessionExpiredRef.current = true;
+          reconnectTimer = setTimeout(() => connect(), 0);
+          return;
+        }
         // Reconnect to the same session with exponential backoff.
         reconnectTimer = setTimeout(() => connect(id), reconnectDelay);
         reconnectDelay = Math.min(reconnectDelay * 2, 30000);
@@ -430,8 +493,23 @@ export default function App() {
 
   const sendMessage = (content = draft.trim()) => {
     if (!content) return;
+    if (turnActive) {
+      // One run at a time: queue the follow-up instead of letting the gateway
+      // reject it (which used to eat the message and break the Stop button).
+      pendingMessageRef.current = content;
+      setDraft('');
+      addMessage({
+        id: newId('system'),
+        role: 'system',
+        content: 'Queued — sending when the current run finishes.',
+        timestamp: Date.now(),
+      });
+      return;
+    }
     addMessage({ id: newId('user'), role: 'user', content, timestamp: Date.now() });
     setDraft('');
+    // Tool steps belong to the turn that produced them; clear last turn's.
+    clearTools();
     if (socketRef.current?.readyState === WebSocket.OPEN) {
       setThinking(true);
       setTurnActive(true);
@@ -489,7 +567,29 @@ export default function App() {
     }
   };
 
+  const handleSampleData = async () => {
+    if (!sessionId || sampleLoading) return;
+    setSampleLoading(true);
+    try {
+      const response = await loadSampleData(sessionId);
+      const summaries = Array.isArray(response.schemas)
+        ? (response.schemas as Array<Record<string, unknown>>)
+        : [];
+      setDatasets(summaries.map((summary) => profileToDataset(summary)));
+    } catch (error) {
+      setSessionError(error instanceof Error ? error.message : 'Could not load the sample data.');
+    } finally {
+      setSampleLoading(false);
+    }
+  };
+
   const handleNewSession = async () => {
+    if (
+      (messages.length > 0 || datasets.length > 0) &&
+      !window.confirm('Start a new session? The current chat, uploads, and artifacts will be discarded.')
+    ) {
+      return;
+    }
     intentionalCloseRef.current = true;
     socketRef.current?.close();
     const oldId = useWorkbench.getState().sessionId;
@@ -521,6 +621,11 @@ export default function App() {
             setDragOver={setDragOver}
             onUpload={handleUpload}
             onDeleteDataset={handleDeleteDataset}
+            onSkipFiles={(names) =>
+              setSessionError(
+                `Skipped ${names.join(', ')} — supported formats are CSV, XLSX, Parquet, and JSON.`,
+              )
+            }
           />
         )}
         {!canvasFullscreen && (
@@ -540,10 +645,13 @@ export default function App() {
                   messages={messages}
                   tools={tools}
                   draft={draft}
+                  datasets={datasets}
                   onDraft={setDraft}
                   onSend={() => sendMessage()}
                   onSuggestion={sendMessage}
                   onUpload={handleUpload}
+                  onSampleData={handleSampleData}
+                  sampleLoading={sampleLoading}
                   inspectorOpen={inspectorOpen}
                   onToggleInspector={() => setInspectorOpen(!inspectorOpen)}
                   execution={execution}
@@ -648,6 +756,7 @@ function Explorer({
   setDragOver,
   onUpload,
   onDeleteDataset,
+  onSkipFiles,
 }: {
   datasets: Dataset[];
   uploading: boolean;
@@ -655,6 +764,7 @@ function Explorer({
   setDragOver: (value: boolean) => void;
   onUpload: (files: File[]) => void;
   onDeleteDataset: (name: string) => void;
+  onSkipFiles: (names: string[]) => void;
 }) {
   const inputRef = useRef<HTMLInputElement>(null);
   return (
@@ -676,9 +786,11 @@ function Explorer({
         onDrop={(e) => {
           e.preventDefault();
           setDragOver(false);
-          const files = Array.from(e.dataTransfer.files).filter((f) =>
-            /\.(csv|xlsx|xls|parquet|json)$/i.test(f.name),
-          );
+          const dropped = Array.from(e.dataTransfer.files);
+          const files = dropped.filter((f) => /\.(csv|xlsx|xls|parquet|json)$/i.test(f.name));
+          // Silent filtering reads as "the app is broken"; say what was skipped.
+          const skipped = dropped.filter((f) => !files.includes(f)).map((f) => f.name);
+          if (skipped.length) onSkipFiles(skipped);
           if (files.length) onUpload(files);
         }}
       >
@@ -837,6 +949,8 @@ function Chat({
   onSend,
   onSuggestion,
   onUpload,
+  onSampleData,
+  sampleLoading,
   inspectorOpen,
   onToggleInspector,
   execution,
@@ -844,6 +958,7 @@ function Chat({
   thinking,
   turnActive,
   onStop,
+  datasets,
 }: {
   messages: WorkbenchState['messages'];
   tools: WorkbenchState['tools'];
@@ -852,6 +967,8 @@ function Chat({
   onSend: () => void;
   onSuggestion: (value: string) => void;
   onUpload: (files: File[]) => void;
+  onSampleData: () => void;
+  sampleLoading: boolean;
   inspectorOpen: boolean;
   onToggleInspector: () => void;
   execution: WorkbenchState['execution'];
@@ -859,12 +976,22 @@ function Chat({
   thinking: boolean;
   turnActive: boolean;
   onStop: () => void;
+  datasets: Dataset[];
 }) {
   const endRef = useRef<HTMLDivElement>(null);
   const attachRef = useRef<HTMLInputElement>(null);
+  const textRef = useRef<HTMLTextAreaElement>(null);
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, tools]);
+  useEffect(() => {
+    // Grow the composer with the draft instead of trapping it at one line.
+    const el = textRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+    el.style.overflowY = el.scrollHeight > 160 ? 'auto' : 'hidden';
+  }, [draft]);
   return (
     <section className="chat-workbench">
       <div className="column-header">
@@ -875,7 +1002,12 @@ function Chat({
       </div>
       <div className="chat-scroll">
         {messages.length === 0 && !thinking ? (
-          <Welcome onSuggestion={onSuggestion} />
+          <Welcome
+            onSuggestion={onSuggestion}
+            datasets={datasets}
+            onSampleData={onSampleData}
+            sampleLoading={sampleLoading}
+          />
         ) : (
           <>
             <div className="message-list">
@@ -904,6 +1036,7 @@ function Chat({
         <Inspector open={inspectorOpen} onToggle={onToggleInspector} execution={execution} />
         <div className="composer-wrap">
           <textarea
+            ref={textRef}
             aria-label="Message Data Copilot"
             value={draft}
             onChange={(event) => onDraft(event.target.value)}
@@ -954,7 +1087,23 @@ function Chat({
   );
 }
 
-function Welcome({ onSuggestion }: { onSuggestion: (value: string) => void }) {
+function Welcome({
+  onSuggestion,
+  datasets,
+  onSampleData,
+  sampleLoading,
+}: {
+  onSuggestion: (value: string) => void;
+  datasets: Dataset[];
+  onSampleData: () => void;
+  sampleLoading: boolean;
+}) {
+  // Suggestions reference the uploaded data once there is some, so a new user
+  // sees prompts that actually apply to their file.
+  const firstName = datasets[0]?.name;
+  const labels = firstName
+    ? [`Explore ${firstName}`, 'Build a dashboard', `Summarize ${firstName}`, 'Create a report']
+    : suggestions.map(({ label }) => label);
   return (
     <div className="welcome">
       <div className="welcome-icon">
@@ -967,11 +1116,17 @@ function Welcome({ onSuggestion }: { onSuggestion: (value: string) => void }) {
         <span>Leave with clarity.</span>
       </h2>
       <p>Upload a dataset and I’ll help you explore patterns, build visualizations, and turn findings into a polished deliverable.</p>
+      {datasets.length === 0 && (
+        <button className="sample-data-button" onClick={onSampleData} disabled={sampleLoading}>
+          <Database size={15} />
+          {sampleLoading ? 'Loading sample data…' : 'Try the sample dataset'}
+        </button>
+      )}
       <div className="suggestion-grid">
-        {suggestions.map(({ label, icon: Icon }) => (
-          <button key={label} onClick={() => onSuggestion(label)}>
+        {suggestions.map(({ icon: Icon }, index) => (
+          <button key={labels[index]} onClick={() => onSuggestion(labels[index])}>
             <Icon size={15} />
-            {label}
+            {labels[index]}
             <ArrowUp size={14} className="suggestion-arrow" />
           </button>
         ))}
@@ -1151,11 +1306,13 @@ function Canvas({
       : '';
     return apiUrl(`/api/sessions/${sessionId}/preview/${artifact.port}/${previewPath}`);
   }, [sessionId, artifact]);
-  const pdfUrl =
+  const fileUrl =
     artifact?.url ||
     (sessionId && artifact?.path
       ? apiUrl(`/api/sessions/${sessionId}/artifacts/${encodeURIComponent(artifact.path)}`)
       : '');
+  // A web app without a downloadable file still has something worth opening.
+  const openUrl = fileUrl || previewUrl;
   return (
     <section className="canvas">
       <div className="canvas-topbar">
@@ -1166,8 +1323,11 @@ function Canvas({
           <button className={tab === 'document' ? 'active' : ''} onClick={() => onTab('document')}>
             <FileText size={14} /> Document
           </button>
+          <button className={tab === 'image' ? 'active' : ''} onClick={() => onTab('image')}>
+            <Image size={14} /> Chart
+          </button>
           <button className={tab === 'empty' ? 'active' : ''} onClick={() => onTab('empty')}>
-            <PanelRight size={14} /> Empty
+            <PanelRight size={14} /> Overview
           </button>
         </div>
         <div className="canvas-tools">
@@ -1207,15 +1367,19 @@ function Canvas({
           <div className="preview-frame" style={{ transform: `scale(${zoom / 100})`, transformOrigin: 'center top', width: `${10000 / zoom}%` }}>
             <iframe key={refreshKey} title="Generated web application" src={previewUrl} sandbox="allow-scripts allow-same-origin allow-forms" />
           </div>
-        ) : tab === 'document' && pdfUrl ? (
+        ) : tab === 'document' && fileUrl ? (
           <div className="document-preview" style={{ transform: `scale(${zoom / 100})`, transformOrigin: 'top center' }}>
             <div className="pdf-sheet">
               <div className="pdf-accent" />
               <div className="pdf-kicker">DATA COPILOT · GENERATED DOCUMENT</div>
               <h2>{artifact?.title || artifact?.name || 'Analysis report'}</h2>
               <p className="pdf-placeholder">Your generated document is ready to view.</p>
-              <iframe title="Generated PDF document" src={pdfUrl} />
+              <iframe title="Generated PDF document" src={fileUrl} />
             </div>
+          </div>
+        ) : tab === 'image' && fileUrl ? (
+          <div className="image-preview" style={{ transform: `scale(${zoom / 100})`, transformOrigin: 'top center' }}>
+            <img key={refreshKey} src={fileUrl} alt={artifact?.title || artifact?.name || 'Generated chart'} />
           </div>
         ) : (
           <CanvasPlaceholder tab={tab} hasArtifact={Boolean(artifact)} onWeb={() => onTab(artifact?.type === 'pdf' ? 'document' : 'web')} />
@@ -1228,26 +1392,33 @@ function Canvas({
         <span className="canvas-footer-right">
           {artifact ? (
             <>
-              <span>{artifact.type === 'pdf' ? 'PDF artifact' : 'Interactive preview'}</span>
+              <span>
+                {artifact.type === 'pdf' || artifact.type === 'document'
+                  ? 'Document artifact'
+                  : artifact.type === 'image'
+                    ? 'Chart artifact'
+                    : 'Interactive preview'}
+              </span>
               <button
+                disabled={!openUrl}
                 onClick={() => {
-                  if (pdfUrl) window.open(pdfUrl, '_blank', 'noopener,noreferrer');
+                  if (openUrl) window.open(openUrl, '_blank', 'noopener,noreferrer');
                 }}
               >
                 <ExternalLink size={13} /> Open
               </button>
-              <button
-                onClick={() => {
-                  if (pdfUrl) {
+              {fileUrl && (
+                <button
+                  onClick={() => {
                     const link = document.createElement('a');
-                    link.href = pdfUrl;
+                    link.href = fileUrl;
                     link.download = artifact.name || 'data-copilot-artifact';
                     link.click();
-                  }
-                }}
-              >
-                <Download size={13} /> Download
-              </button>
+                  }}
+                >
+                  <Download size={13} /> Download
+                </button>
+              )}
             </>
           ) : (
             'Artifacts appear here after a run'
@@ -1262,7 +1433,9 @@ function CanvasPlaceholder({ tab, hasArtifact, onWeb }: { tab: string; hasArtifa
   return (
     <div className="canvas-placeholder">
       <div className="placeholder-grid" />
-      <div className="placeholder-icon">{tab === 'document' ? <FileText size={24} /> : <Globe2 size={24} />}</div>
+      <div className="placeholder-icon">
+        {tab === 'document' ? <FileText size={24} /> : tab === 'image' ? <Image size={24} /> : <Globe2 size={24} />}
+      </div>
       <h2>{hasArtifact ? 'Choose an artifact view' : 'Your canvas is ready'}</h2>
       <p>
         {hasArtifact

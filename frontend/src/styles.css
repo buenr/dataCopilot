@@ -112,6 +112,9 @@ h1, h2, p { margin: 0; }
 .welcome h2 { margin-top: 10px; color: #f0f4fb; font: 600 25px/1.2 'Space Grotesk', sans-serif; letter-spacing: -.045em; }
 .welcome h2 span { color: #8393ad; }
 .welcome > p { max-width: 390px; margin-top: 14px; color: #818fa3; font-size: 12px; line-height: 1.65; }
+.sample-data-button { display: inline-flex; align-items: center; gap: 8px; margin-top: 16px; padding: 9px 16px; border: 1px solid #3f6091; border-radius: 6px; color: #cfe0f7; background: linear-gradient(135deg, rgba(81, 127, 208, .25), rgba(126, 168, 239, .12)); font-size: 11px; font-weight: 600; cursor: pointer; transition: border .16s, background .16s, transform .16s; }
+.sample-data-button:hover:not(:disabled) { border-color: #7ea8ef; background: rgba(81, 127, 208, .35); transform: translateY(-1px); }
+.sample-data-button:disabled { opacity: .55; cursor: wait; }
 .suggestion-grid { width: 100%; display: grid; grid-template-columns: 1fr 1fr; gap: 7px; margin-top: 25px; }
 .suggestion-grid button { display: flex; align-items: center; gap: 8px; min-height: 37px; padding: 0 10px; border: 1px solid #223044; border-radius: 5px; color: #9baac0; background: rgba(17, 24, 34, .7); text-align: left; font-size: 10px; cursor: pointer; transition: border .16s, background .16s, color .16s; }
 .suggestion-grid button:hover { border-color: #45648f; color: #d0ddf1; background: #152132; }
@@ -150,7 +153,7 @@ h1, h2, p { margin: 0; }
 .chat-bottom { flex: none; padding: 0 20px 13px; }
 .composer-wrap { padding: 10px 11px 8px; border: 1px solid #29374a; border-radius: 8px; background: #111721; box-shadow: 0 7px 25px rgba(0, 0, 0, .13); }
 .composer-wrap:focus-within { border-color: #3f6091; }
-.composer-wrap textarea { width: 100%; display: block; max-height: 90px; resize: none; padding: 0; border: 0; outline: 0; color: #dbe5f3; background: transparent; font-size: 12px; line-height: 1.5; }
+.composer-wrap textarea { width: 100%; display: block; max-height: 160px; resize: none; padding: 0; border: 0; outline: 0; color: #dbe5f3; background: transparent; font-size: 12px; line-height: 1.5; }
 .composer-wrap textarea::placeholder { color: #5f6e83; }
 .composer-actions { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
 .attach-button { display: grid; place-items: center; width: 23px; height: 23px; padding: 0; border: 0; color: #708096; background: none; cursor: pointer; }
@@ -205,6 +208,8 @@ h1, h2, p { margin: 0; }
 .pdf-sheet h2 { max-width: 500px; margin-top: 13px; font: 700 30px/1.15 'Space Grotesk', sans-serif; letter-spacing: -.04em; }
 .pdf-placeholder { margin-top: 11px; color: #728096; font-size: 12px; }
 .pdf-sheet iframe { width: 100%; height: 520px; display: block; margin-top: 25px; border: 0; background: #fff; }
+.image-preview { min-height: 100%; position: relative; z-index: 1; display: flex; align-items: flex-start; justify-content: center; padding: 35px; }
+.image-preview img { max-width: min(760px, 100%); border: 1px solid #263549; border-radius: 7px; background: #fff; box-shadow: 0 18px 55px rgba(0, 0, 0, .3); }
 .canvas-placeholder { min-height: 100%; position: relative; z-index: 1; display: flex; align-items: center; justify-content: center; flex-direction: column; padding: 50px; text-align: center; }
 .placeholder-grid { position: absolute; width: 390px; height: 190px; border: 1px solid rgba(59, 81, 110, .23); border-radius: 12px; transform: perspective(500px) rotateX(55deg) rotateZ(-4deg); opacity: .55; background-image: linear-gradient(rgba(68, 94, 128, .18) 1px, transparent 1px), linear-gradient(90deg, rgba(68, 94, 128, .18) 1px, transparent 1px); background-size: 27px 27px; }
 .placeholder-icon { position: relative; display: grid; place-items: center; width: 52px; height: 52px; border: 1px solid #2f4566; border-radius: 13px; color: #82aaf0; background: #142238; box-shadow: 0 0 34px rgba(57, 101, 172, .17); }

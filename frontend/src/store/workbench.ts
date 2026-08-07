@@ -50,6 +50,12 @@ export type WorkbenchState = {
 
 const artifactKey = (artifact: Artifact) => artifact.name ?? artifact.path ?? artifact.url ?? '';
 
+const tabForArtifact = (artifact: Artifact): CanvasTab => {
+  if (artifact.type === 'pdf' || artifact.type === 'document') return 'document';
+  if (artifact.type === 'image') return 'image';
+  return 'web';
+};
+
 const defaultExecution: ExecutionState = {
   stdout: '',
   stderr: '',
@@ -134,7 +140,7 @@ export const useWorkbench = create<WorkbenchState>((set) => ({
       return {
         artifact,
         artifacts,
-        canvasTab: artifact.type === 'pdf' || artifact.type === 'document' ? 'document' : 'web',
+        canvasTab: tabForArtifact(artifact),
       };
     }),
   selectArtifact: (name) =>
@@ -143,7 +149,7 @@ export const useWorkbench = create<WorkbenchState>((set) => ({
       if (!artifact) return {};
       return {
         artifact,
-        canvasTab: artifact.type === 'pdf' || artifact.type === 'document' ? 'document' : 'web',
+        canvasTab: tabForArtifact(artifact),
       };
     }),
   setCanvasTab: (canvasTab) => set({ canvasTab }),

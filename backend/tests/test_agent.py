@@ -670,3 +670,101 @@ def test_report_request_detects_whitepaper_with_long_parenthetical():
     assert Agent._is_report_request("generate a report")
     assert not Agent._is_report_request("build a dashboard")
     assert not Agent._is_report_request("what does the report say")
+
+
+class AnalysisNoPdfProvider:
+    """Provider that runs analysis but never writes a PDF or calls register_artifact."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def stream(self, messages, tools):
+        self.calls += 1
+        if self.calls == 1:
+            yield {
+                "tool": "run_python",
+                "arguments": {"code": "print('Player A: 28 pts, 12 ast\\nPlayer B: 24 pts, 8 reb')"},
+            }
+        elif self.calls == 2:
+            yield "Analysis complete. Player A leads in scoring and assists."
+
+
+@pytest.mark.asyncio
+async def test_fallback_pdf_generated_when_provider_omits_pdf(tmp_path: Path):
+    """When the LLM analyzes data but never writes a PDF, the agent builds one."""
+    sandbox = FakeSandbox("fallback-pdf", tmp_path / "workspace")
+    agent = Agent(
+        sandbox,
+        AnalysisNoPdfProvider(),
+        "fallback-pdf",
+        tmp_path / "sessions",
+    )
+
+    try:
+        events = [event async for event in agent.turn("Create a whitepaper with analysis")]
+    finally:
+        await sandbox.close()
+
+    artifact = next(event for event in events if event["type"] == "artifact")
+    assert artifact["name"] == "report.pdf"
+    assert artifact["artifact"]["type"] == "pdf"
+    assert any(
+        event["type"] == "assistant_message"
+        and "ready in the canvas" in event["content"]
+        for event in events
+    )
+    # The fallback PDF must be a valid PDF file in the workspace.
+    pdf_path = sandbox.root / "report.pdf"
+    assert pdf_path.exists()
+    assert pdf_path.read_bytes().startswith(b"%PDF-")
+
+
+@pytest.mark.asyncio
+async def test_mock_explore_request_returns_grounded_summary(tmp_path: Path):
+    """The welcome screen's 'Explore my data' suggestion must not dead-end."""
+    sandbox = FakeSandbox("explore", tmp_path / "workspace")
+    profiles = [
+        {
+            "name": "df_1",
+            "file": "sales.csv",
+            "rows": 4,
+            "columns": 2,
+            "numeric_stats": {},
+        }
+    ]
+    agent = Agent(
+        sandbox,
+        MockProvider(),
+        "explore",
+        tmp_path / "sessions",
+        dataset_context=lambda: profiles,
+    )
+
+    try:
+        events = [event async for event in agent.turn("Explore my data")]
+    finally:
+        await sandbox.close()
+
+    message = next(event["content"] for event in events if event["type"] == "assistant_message")
+    assert "sales.csv" in message
+    assert "I can analyze" not in message
+
+
+@pytest.mark.asyncio
+async def test_mock_chart_request_registers_image_artifact(tmp_path: Path):
+    sandbox = FakeSandbox("chart", tmp_path / "workspace")
+    await sandbox.upload("data/sales.csv", b"region,revenue\nNorth,1200\nSouth,950\n")
+    await sandbox.exec("import pandas as pd\ndf_1 = pd.read_csv(WORKSPACE / 'data/sales.csv')")
+    agent = Agent(sandbox, MockProvider(), "chart", tmp_path / "sessions")
+
+    try:
+        events = [event async for event in agent.turn("Show me a chart of the data")]
+    finally:
+        await sandbox.close()
+
+    artifact = next(event for event in events if event["type"] == "artifact")
+    assert artifact["name"] == "chart.svg"
+    assert artifact["artifact"]["type"] == "image"
+    svg = (tmp_path / "workspace" / "chart.svg").read_text()
+    assert svg.startswith("<svg")
+    assert "revenue" in svg

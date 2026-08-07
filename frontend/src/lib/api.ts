@@ -42,6 +42,19 @@ export async function deleteSession(sessionId: string) {
   }
 }
 
+async function throwWithDetail(response: Response, fallback: string): Promise<never> {
+  // FastAPI returns {"detail": "..."} — surface it instead of a bare status code
+  // so users see e.g. why a dataset could not be profiled.
+  let message = `${fallback} (${response.status})`;
+  try {
+    const body = (await response.json()) as Record<string, unknown>;
+    if (typeof body?.detail === 'string' && body.detail) message = body.detail;
+  } catch {
+    // Non-JSON error body: keep the fallback.
+  }
+  throw new Error(message);
+}
+
 export async function uploadDataset(sessionId: string, files: File[]) {
   const form = new FormData();
   for (const file of files) form.append('files', file);
@@ -49,12 +62,18 @@ export async function uploadDataset(sessionId: string, files: File[]) {
     method: 'POST',
     body: form,
   });
-  if (!response.ok) throw new Error(`Upload failed (${response.status})`);
+  if (!response.ok) await throwWithDetail(response, 'Upload failed');
   return (await response.json().catch(() => ({}))) as Record<string, unknown>;
 }
 
 export async function deleteDataset(sessionId: string, name: string) {
   const response = await fetch(apiUrl(`/api/sessions/${sessionId}/files/${encodeURIComponent(name)}`), { method: 'DELETE' });
-  if (!response.ok) throw new Error(`Dataset removal failed (${response.status})`);
+  if (!response.ok) await throwWithDetail(response, 'Dataset removal failed');
+  return (await response.json().catch(() => ({}))) as Record<string, unknown>;
+}
+
+export async function loadSampleData(sessionId: string) {
+  const response = await fetch(apiUrl(`/api/sessions/${sessionId}/sample-data`), { method: 'POST' });
+  if (!response.ok) await throwWithDetail(response, 'Could not load the sample data');
   return (await response.json().catch(() => ({}))) as Record<string, unknown>;
 }

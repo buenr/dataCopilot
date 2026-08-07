@@ -137,7 +137,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "type": "object",
                 "properties": {
                     "name": {"type": "string"},
-                    "type": {"type": "string", "enum": ["webapp", "pdf", "document"]},
+                    "type": {"type": "string", "enum": ["webapp", "pdf", "document", "image"]},
                     "port": {"type": "integer"},
                 },
                 "required": ["name"],
@@ -178,6 +178,11 @@ defined for you; never reassign it, and never substitute os.getcwd() for it.
 Only files inside the workspace can be previewed or downloaded, so do not save
 the only copy under /mnt/data or /tmp, and do not claim completion without
 registering the PDF artifact.
+
+For chart or visualization requests, compute the chart from the uploaded data
+and save it as a PNG or SVG inside the workspace (for example,
+Path(WORKSPACE) / "chart.png"), then call register_artifact with the filename
+and type "image" so it renders on the canvas.
 """
     if not dataset_profiles:
         return prompt + "\nNo dataset has been uploaded yet."
@@ -267,7 +272,10 @@ class MockProvider:
         elif "pdf" in prompt or "report" in prompt or "whitepaper" in prompt:
             yield {"tool": "run_python", "arguments": {"code": pdf_code()}}
             yield {"tool": "register_artifact", "arguments": {"name": "report.pdf", "type": "pdf"}}
-        elif any(term in prompt for term in ("executive summary", "summary", "insight", "analy")):
+        elif any(term in prompt for term in ("chart", "graph", "plot", "visuali")):
+            yield {"tool": "run_python", "arguments": {"code": chart_code()}}
+            yield {"tool": "register_artifact", "arguments": {"name": "chart.svg", "type": "image"}}
+        elif any(term in prompt for term in ("executive summary", "summary", "insight", "analy", "explore")):
             yield mock_executive_summary(messages)
         else:
             yield "I can analyze the uploaded data, build a dashboard, or write a PDF report."
@@ -312,6 +320,41 @@ xref = len(pdf); pdf.extend(f"xref\n0 {len(objects)+1}\n0000000000 65535 f \n".e
 for offset in offsets[1:]: pdf.extend(f"{offset:010d} 00000 n \n".encode())
 pdf.extend(f"trailer\n<< /Size {len(objects)+1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode())
 (workspace / "report.pdf").write_bytes(pdf)
+"""
+
+
+def chart_code() -> str:
+    # Dependency-free SVG bar chart so the offline mock needs no matplotlib.
+    return r"""from pathlib import Path
+import html
+workspace = Path(WORKSPACE)
+frame = globals().get("df_1")
+means = []
+if frame is not None:
+    numeric = frame.select_dtypes(include="number")
+    for name, value in numeric.mean().head(8).items():
+        value = float(value)
+        if value == value:  # drop NaN averages
+            means.append((str(name), value))
+top = max((abs(value) for _, value in means), default=0.0) or 1.0
+bars = [(name, value, max(4, round(260 * abs(value) / top))) for name, value in means]
+if not bars:
+    bars = [("no numeric columns", 0.0, 4)]
+width = 80 + 110 * len(bars)
+parts = [
+    f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="380" font-family="system-ui, sans-serif">',
+    '<rect width="100%" height="100%" fill="#ffffff"/>',
+    '<text x="24" y="36" font-size="18" font-weight="700" fill="#0f172a">Column averages</text>',
+]
+for i, (name, value, height) in enumerate(bars):
+    x = 40 + 110 * i
+    y = 320 - height
+    label = html.escape(name if len(name) <= 12 else name[:11] + "...")
+    parts.append(f'<rect x="{x}" y="{y}" width="70" height="{height}" rx="6" fill="#2563eb"/>')
+    parts.append(f'<text x="{x + 35}" y="{y - 8}" font-size="12" text-anchor="middle" fill="#334155">{value:,.1f}</text>')
+    parts.append(f'<text x="{x + 35}" y="342" font-size="11" text-anchor="middle" fill="#64748b">{label}</text>')
+parts.append("</svg>")
+(workspace / "chart.svg").write_text("\n".join(parts), encoding="utf-8")
 """
 
 
@@ -690,8 +733,62 @@ class Agent:
         path = str(artifact.get("path") or artifact.get("name") or "").lower()
         return artifact.get("type") == "pdf" or path.endswith(".pdf")
 
-    async def _recover_pdf_artifact(self) -> tuple[dict[str, Any] | None, str | None]:
-        """Recover a PDF when a provider wrote it but omitted the handoff."""
+    @staticmethod
+    def _fallback_pdf_code(content: str) -> str:
+        """Return sandbox code that builds a simple PDF from analysis text.
+
+        Dependency-free (same raw-PDF approach as the mock provider) so it
+        works in both the Docker sandbox and the in-process FakeSandbox.
+        Content is base64-encoded to avoid all escaping issues.
+        """
+        import base64
+
+        content_b64 = base64.b64encode(content.encode()).decode()
+        return '''
+import base64
+from pathlib import Path
+
+workspace = Path(WORKSPACE)
+content = base64.b64decode("''' + content_b64 + '''").decode()
+
+lines = content.split("\\n")[:35]
+objects = [
+    b"<< /Type /Catalog /Pages 2 0 R >>",
+    b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+]
+parts = []
+y = 700
+for line in lines:
+    esc = line.replace("\\\\", "\\\\\\\\").replace("(", "\\\\(").replace(")", "\\\\)")
+    parts.append("BT /F1 11 Tf 72 " + str(y) + " Td (" + esc + ") Tj ET")
+    y -= 16
+data = "\\n".join(parts).encode()
+objects.append(b"<< /Length " + str(len(data)).encode() + b" >>\\nstream\\n" + data + b"endstream")
+objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+
+pdf = bytearray(b"%PDF-1.4\\n")
+offsets = [0]
+for i, obj in enumerate(objects, 1):
+    offsets.append(len(pdf))
+    pdf.extend(str(i).encode() + b" 0 obj\\n" + obj + b"\\nendobj\\n")
+xref = len(pdf)
+pdf.extend(b"xref\\n0 " + str(len(objects) + 1).encode() + b"\\n0000000000 65535 f \\n")
+for off in offsets[1:]:
+    pdf.extend(str(off).zfill(10).encode() + b" 00000 n \\n")
+pdf.extend(b"trailer\\n<< /Size " + str(len(objects) + 1).encode() + b" /Root 1 0 R >>\\nstartxref\\n" + str(xref).encode() + b"\\n%%EOF\\n")
+(workspace / "report.pdf").write_bytes(bytes(pdf))
+print("Fallback PDF written")
+'''
+
+    async def _recover_pdf_artifact(
+        self, fallback_content: str = ""
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Recover a PDF when a provider wrote it but omitted the handoff.
+
+        If no PDF exists after the rescue sweep, generate one from the
+        assistant's analysis text so the user always gets a canvas artifact.
+        """
         async def find_pdf() -> str | None:
             listing = await self.dispatcher.dispatch("list_files", {"path": "."})
             files = listing.get("files", [])
@@ -721,6 +818,13 @@ class Agent:
             # never arbitrary host paths, into the persisted workspace.
             if not pdf_path and not hasattr(self.dispatcher.sandbox, "root"):
                 await self.dispatcher.dispatch("run_python", {"code": PDF_RESCUE_CODE})
+                pdf_path = await find_pdf()
+            if not pdf_path and fallback_content:
+                # The provider ran analysis but never wrote a PDF. Build one
+                # from the collected output so the canvas is not empty.
+                await self.dispatcher.dispatch(
+                    "run_python", {"code": self._fallback_pdf_code(fallback_content)}
+                )
                 pdf_path = await find_pdf()
             if not pdf_path:
                 return None, "no PDF artifact was found in the sandbox workspace"
@@ -1092,6 +1196,8 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
             report_request = self._is_report_request(content)
             renderable_artifact = False
             started_ports: dict[int, str] = {}
+            all_text: list[str] = []
+            run_python_outputs: list[str] = []
             for _ in range(4):
                 text_parts: list[str] = []
                 tool_calls: list[tuple[str, str, dict[str, Any], dict[str, Any]]] = []
@@ -1136,6 +1242,9 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
                     tool_calls.append((provider_call_id, item["tool"], arguments, tool_result))
                     yield {"type": "tool_result", "id": tool_id, "tool": item["tool"], **tool_result}
                     if item["tool"] == "run_python":
+                        stdout = str(tool_result.get("stdout", ""))
+                        if stdout.strip():
+                            run_python_outputs.append(stdout.strip())
                         try:
                             variables = await self.dispatcher.sandbox.vars()
                         except Exception:
@@ -1210,6 +1319,8 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
                                 "artifact": artifact,
                             }
                 final_text = "".join(text_parts)
+                if final_text:
+                    all_text.append(final_text)
                 if not tool_calls:
                     break
                 request_messages.append(
@@ -1239,7 +1350,10 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
                         }
                     )
             if report_request and not renderable_artifact:
-                recovered, recovery_error = await self._recover_pdf_artifact()
+                fallback_content = "\n\n".join(all_text or run_python_outputs)
+                recovered, recovery_error = await self._recover_pdf_artifact(
+                    fallback_content
+                )
                 if recovered:
                     self.dispatcher.record(
                         {"type": "artifact_recovered", "artifact": recovered}

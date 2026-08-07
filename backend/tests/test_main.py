@@ -333,3 +333,58 @@ async def test_delete_missing_dataset_returns_404(tmp_path: Path):
         session_id = created.json()["id"]
         response = await client.delete(f"/api/sessions/{session_id}/files/nonexistent.csv")
         assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_sample_data_endpoint_loads_bundled_datasets(tmp_path: Path):
+    sample_dir = tmp_path / "sample_data"
+    sample_dir.mkdir()
+    (sample_dir / "people.csv").write_text("name,score\nAda,10\nGrace,20\n")
+    settings = Settings(
+        sessions_dir=str(tmp_path / "sessions"),
+        sample_data_dir=str(sample_dir),
+    )
+    manager = SessionManager(
+        settings,
+        sandbox_factory=lambda sid: FakeSandbox(sid, tmp_path / "workspaces" / sid),
+    )
+    application = create_app(settings, manager)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application),
+        base_url="http://test",
+    ) as client:
+        created = await client.post("/api/sessions")
+        session_id = created.json()["id"]
+        response = await client.post(f"/api/sessions/{session_id}/sample-data")
+
+    assert response.status_code == 200
+    schema = response.json()["schemas"][0]
+    assert schema["file"] == "people.csv"
+    assert schema["rows"] == 2
+    session = manager.get(session_id)
+    execution = await session.sandbox.exec("print(df_1['score'].sum())")
+    assert execution.stdout.strip() == "30"
+
+
+@pytest.mark.asyncio
+async def test_sample_data_endpoint_404_when_nothing_bundled(tmp_path: Path):
+    settings = Settings(
+        sessions_dir=str(tmp_path / "sessions"),
+        sample_data_dir=str(tmp_path / "missing-sample-data"),
+    )
+    manager = SessionManager(
+        settings,
+        sandbox_factory=lambda sid: FakeSandbox(sid, tmp_path / "workspaces" / sid),
+    )
+    application = create_app(settings, manager)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application),
+        base_url="http://test",
+    ) as client:
+        created = await client.post("/api/sessions")
+        session_id = created.json()["id"]
+        response = await client.post(f"/api/sessions/{session_id}/sample-data")
+
+    assert response.status_code == 404

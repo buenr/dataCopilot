@@ -7,7 +7,7 @@ import json
 import mimetypes
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 
 from .agent import Agent, AnthropicProvider, MockProvider, OpenAIProvider
 from .config import Settings, get_settings
-from .profiling import profile_files
+from .profiling import SUPPORTED_SUFFIXES, profile_files
 from .proxy import parse_preview_path, preview_target
 from .sandbox import SessionManager
 
@@ -267,6 +267,25 @@ def create_app(settings: Settings | None = None, manager: SessionManager | None 
         # have to be rebuilt together.
         return {"deleted": target, "schemas": await reload_datasets(session)}
 
+    @application.post("/api/sessions/{session_id}/sample-data")
+    async def load_sample_data(session_id: str) -> dict[str, Any]:
+        """Load the bundled sample datasets so a new user can try the app
+        without having a CSV of their own handy."""
+        try:
+            session = session_manager.get(session_id)
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        source = Path(settings.sample_data_dir)
+        uploaded: list[str] = []
+        if source.is_dir():
+            for path in sorted(source.iterdir()):
+                if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES:
+                    await session.sandbox.upload(f"data/{path.name}", path.read_bytes())
+                    uploaded.append(f"data/{path.name}")
+        if not uploaded:
+            raise HTTPException(404, "no sample datasets are bundled with this deployment")
+        return {"files": uploaded, "schemas": await reload_datasets(session)}
+
     @application.get("/api/sessions/{session_id}/artifacts/{name:path}")
     async def download_artifact(session_id: str, name: str) -> Response:
         try:
@@ -292,6 +311,9 @@ def create_app(settings: Settings | None = None, manager: SessionManager | None 
             session = session_manager.get(session_id)
         except KeyError as exc:
             raise HTTPException(404, "preview unavailable") from exc
+        # Interacting with a previewed app is activity too; otherwise a user
+        # clicking through their dashboard for 30 minutes loses the session.
+        session_manager.touch(session_id)
         mapped_port = session.sandbox.preview_ports.get(port)
         if mapped_port is None:
             # Never dial a client-supplied port: only ports a webapp registered
@@ -337,6 +359,8 @@ def create_app(settings: Settings | None = None, manager: SessionManager | None 
         except KeyError:
             await websocket.close(code=4404)
             return
+        # Same activity signal as the HTTP preview proxy above.
+        session_manager.touch(session_id)
         mapped = session.sandbox.preview_ports.get(port)
         if mapped is None:
             # Same loopback-SSRF guard as the HTTP preview proxy above.
