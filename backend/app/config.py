@@ -22,9 +22,6 @@ class Settings(BaseSettings):
     openai_api_key: str = Field(default="", repr=False)
     anthropic_model: str = "claude-sonnet-5"
     openai_model: str = "gpt-5.6"
-    # Reasoning effort for OpenAI reasoning models (none/low/medium/high/
-    # xhigh/max on gpt-5.6-luna). Empty leaves the model's own default.
-    openai_reasoning_effort: str = ""
     sessions_dir: str = "sessions"
 
 
