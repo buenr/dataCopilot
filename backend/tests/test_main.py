@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 
 import httpx
@@ -278,6 +279,103 @@ def test_session_resume_replays_transcript(tmp_path: Path):
             messages = ready["messages"]
             assert any(m["role"] == "user" and "hello" in m["content"] for m in messages)
             assert any(m["role"] == "assistant" for m in messages)
+
+
+def test_session_resume_replays_artifacts(tmp_path: Path):
+    from fastapi.testclient import TestClient
+
+    settings = Settings(sessions_dir=str(tmp_path / "sessions"), llm_provider="mock")
+    manager = SessionManager(
+        settings,
+        sandbox_factory=lambda sid: FakeSandbox(sid, tmp_path / "workspaces" / sid),
+    )
+    application = create_app(settings, manager)
+
+    with TestClient(application) as client:
+        session_id = client.post("/api/sessions").json()["id"]
+        # A generated dashboard exists in the sandbox workspace.
+        (tmp_path / "workspaces" / session_id / "dashboard.html").write_text("<!doctype html>")
+        # A reconnecting browser gets the artifact list in session_ready, so a
+        # refresh does not empty the canvas.
+        with client.websocket_connect(f"/ws/sessions/{session_id}") as socket:
+            ready = socket.receive_json()
+            assert ready["type"] == "session_ready"
+            assert any(a["name"] == "dashboard.html" for a in ready["artifacts"])
+
+
+def test_session_resume_restores_registered_artifact_metadata(tmp_path: Path):
+    from fastapi.testclient import TestClient
+
+    settings = Settings(sessions_dir=str(tmp_path / "sessions"), llm_provider="mock")
+    manager = SessionManager(
+        settings,
+        sandbox_factory=lambda sid: FakeSandbox(sid, tmp_path / "workspaces" / sid),
+    )
+    application = create_app(settings, manager)
+
+    with TestClient(application) as client:
+        session_id = client.post("/api/sessions").json()["id"]
+        workspace = tmp_path / "workspaces" / session_id
+        workspace.mkdir(parents=True, exist_ok=True)
+        (workspace / "dashboard.html").write_text("<!doctype html>")
+        (workspace / "report.pdf").write_bytes(b"%PDF-1.4 fake")
+        (workspace / "chart.png").write_bytes(b"\x89PNG fake")
+        # The sandbox scan reports name/path/size only; the trajectory remembers
+        # the type and port the model declared for each artifact.
+        trajectory = tmp_path / "sessions" / session_id / "trajectory.jsonl"
+        trajectory.parent.mkdir(parents=True, exist_ok=True)
+        trajectory.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "tool_result",
+                            "tool": "register_artifact",
+                            "result": {
+                                "artifacts": [
+                                    {
+                                        "name": "dashboard.html",
+                                        "path": "dashboard.html",
+                                        "size": 15,
+                                        "port": 8501,
+                                        "type": "webapp",
+                                    }
+                                ]
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "tool_result",
+                            "tool": "register_artifact",
+                            "result": {
+                                "artifacts": [
+                                    {
+                                        "name": "report.pdf",
+                                        "path": "report.pdf",
+                                        "size": 12,
+                                        "type": "pdf",
+                                    }
+                                ]
+                            },
+                        }
+                    ),
+                ]
+            )
+            + "\n"
+        )
+
+        with client.websocket_connect(f"/ws/sessions/{session_id}") as socket:
+            ready = socket.receive_json()
+            artifacts = {a["name"]: a for a in ready["artifacts"]}
+            assert artifacts["dashboard.html"]["type"] == "webapp"
+            assert artifacts["dashboard.html"]["port"] == 8501
+            assert artifacts["report.pdf"]["type"] == "pdf"
+            # An unregistered scan hit still lands on a sensible tab.
+            assert artifacts["chart.png"]["type"] == "image"
+            # Registered artifacts replay last so the canvas re-selects the
+            # artifact the user was looking at.
+            assert ready["artifacts"][-1]["name"] == "report.pdf"
 
 
 @pytest.mark.asyncio

@@ -54,7 +54,7 @@ import {
 } from './lib/api';
 import { useWorkbench } from './store/workbench';
 import type { WorkbenchState } from './store/workbench';
-import type { ChatMessage, Dataset, DatasetColumn, SessionEvent } from './types';
+import type { Artifact, ChatMessage, Dataset, DatasetColumn, SessionEvent } from './types';
 
 const suggestions = [
   { label: 'Explore my data', icon: Search },
@@ -67,6 +67,18 @@ const newId = (prefix: string) => `${prefix}-${Date.now()}-${Math.random().toStr
 
 function textValue(value: unknown, fallback = '') {
   return typeof value === 'string' ? value : fallback;
+}
+
+// Shared by the live artifact event and the session_ready replay.
+function toArtifact(incoming: Record<string, unknown>): Artifact {
+  return {
+    type: (incoming.type ?? incoming.kind ?? 'webapp') as Artifact['type'],
+    name: textValue(incoming.name),
+    title: textValue(incoming.title),
+    url: textValue(incoming.url),
+    path: textValue(incoming.path),
+    port: Number(incoming.port ?? 0) || undefined,
+  };
 }
 
 function fileIcon(kind: string) {
@@ -236,6 +248,14 @@ export default function App() {
             ),
           );
         }
+        const replayArtifacts = (event as Record<string, unknown>).artifacts;
+        if (Array.isArray(replayArtifacts)) {
+          // Without this a refresh would empty the canvas even though the
+          // sandbox still holds every generated dashboard and report.
+          for (const item of replayArtifacts as Array<Record<string, unknown>>) {
+            wb.setArtifact(toArtifact(item));
+          }
+        }
         wb.clearTools();
         wb.updateExecution({ stdout: '', stderr: '', code: '', variables: [], running: false });
         wb.setThinking(false);
@@ -319,15 +339,7 @@ export default function App() {
         break;
       }
       case 'artifact': {
-        const incoming = (payload.artifact ?? payload) as Record<string, unknown>;
-        wb.setArtifact({
-          type: (incoming.type ?? incoming.kind ?? 'webapp') as 'webapp' | 'pdf' | 'document',
-          name: textValue(incoming.name),
-          title: textValue(incoming.title),
-          url: textValue(incoming.url),
-          path: textValue(incoming.path),
-          port: Number(incoming.port ?? 0) || undefined,
-        });
+        wb.setArtifact(toArtifact((payload.artifact ?? payload) as Record<string, unknown>));
         break;
       }
       case 'cancelled':

@@ -179,6 +179,44 @@ def make_provider(settings: Settings) -> Any:
     return MockProvider()
 
 
+def _restored_artifacts(
+    sessions_dir: Path, session_id: str, scanned: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Merge the sandbox artifact scan with what the run actually registered.
+
+    The scan only reports name/path/size; the trajectory's register_artifact
+    results remember the declared type and port, which the canvas needs to
+    render a web app after a reconnect. Unregistered files get a type inferred
+    from their extension so they still land on a sensible tab. Registered
+    artifacts come last so the replay re-selects what the user last saw.
+    """
+    registered: dict[str, dict[str, Any]] = {}
+    trajectory = sessions_dir / session_id / "trajectory.jsonl"
+    try:
+        for line in trajectory.read_text(encoding="utf-8").splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") != "tool_result" or event.get("tool") != "register_artifact":
+                continue
+            for artifact in (event.get("result") or {}).get("artifacts") or []:
+                if isinstance(artifact, dict) and artifact.get("name"):
+                    registered[str(artifact["name"])] = artifact
+    except OSError:
+        pass
+    inferred = {".pdf": "pdf", ".png": "image", ".jpg": "image", ".jpeg": "image", ".svg": "image"}
+    restored: list[dict[str, Any]] = []
+    for item in scanned:
+        name = str(item.get("name") or "")
+        if not name or name in registered:
+            continue
+        suffix = f".{name.rsplit('.', 1)[-1].lower()}" if "." in name else ""
+        restored.append({**item, "type": inferred.get(suffix, "document")})
+    restored.extend(registered.values())
+    return restored
+
+
 async def reap_loop(manager: SessionManager, stop: asyncio.Event) -> None:
     while not stop.is_set():
         try:
@@ -392,6 +430,12 @@ def create_app(settings: Settings | None = None, manager: SessionManager | None 
             await websocket.send_json({"type": "error", "message": "session not found"})
             await websocket.close(code=4404)
             return
+        try:
+            artifacts = await session.sandbox.artifacts()
+        except Exception:
+            # Best-effort: a sandbox hiccup must not break the reconnect handshake.
+            artifacts = []
+        artifacts = _restored_artifacts(Path(settings.sessions_dir), session_id, artifacts)
         await websocket.send_json(
             {
                 "type": "session_ready",
@@ -400,6 +444,8 @@ def create_app(settings: Settings | None = None, manager: SessionManager | None 
                 # replay what the browser cannot rebuild on its own.
                 "messages": session.transcript,
                 "datasets": session.dataset_profiles,
+                # Registered artifacts too, or a refresh would empty the canvas.
+                "artifacts": artifacts,
             }
         )
         agent = Agent(

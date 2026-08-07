@@ -876,3 +876,72 @@ async def test_openai_provider_always_uses_max_reasoning_effort(monkeypatch):
     _ = [item async for item in provider.stream([{"role": "user", "content": "hi"}], [])]
 
     assert fake.requests[0]["reasoning"] == {"effort": "max"}
+
+
+class _BothArtifactsProvider:
+    """Registers a dashboard and a PDF across two rounds, then wraps up."""
+
+    async def stream(self, messages, tools):
+        tool_results = sum(1 for m in messages if m.get("role") == "tool")
+        if tool_results == 0:
+            yield {
+                "tool": "register_artifact",
+                "arguments": {"name": "dashboard.html", "type": "webapp", "port": 8501},
+                "call_id": "c1",
+            }
+        elif tool_results == 1:
+            yield {
+                "tool": "register_artifact",
+                "arguments": {"name": "report.pdf", "type": "pdf"},
+                "call_id": "c2",
+            }
+        else:
+            yield "Both artifacts are ready."
+
+
+@pytest.mark.asyncio
+async def test_dashboard_and_report_turn_publishes_both_artifacts(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "dashboard.html").write_text("<!doctype html><p>data</p>")
+    (workspace / "report.pdf").write_bytes(b"%PDF-1.4 fake")
+    sandbox = FakeSandbox("both", workspace)
+    agent = Agent(sandbox, _BothArtifactsProvider(), "both", tmp_path / "sessions")
+
+    try:
+        events = [event async for event in agent.turn("Build a dashboard and write a PDF report")]
+    finally:
+        await sandbox.close()
+
+    # A combined dashboard+report request must publish each artifact to the
+    # canvas; the per-request gates used to filter out both.
+    names = [event.get("name") for event in events if event["type"] == "artifact"]
+    assert "dashboard.html" in names
+    assert "report.pdf" in names
+
+
+class _BadReadProvider:
+    """Calls read_file on a missing file, then wraps up after the error."""
+
+    async def stream(self, messages, tools):
+        if any(m.get("role") == "tool" for m in messages):
+            yield "Recovered from the failed read."
+            return
+        yield {"tool": "read_file", "arguments": {"path": "missing.txt"}, "call_id": "bad"}
+
+
+@pytest.mark.asyncio
+async def test_tool_failure_returns_error_result_instead_of_killing_turn(tmp_path: Path):
+    sandbox = FakeSandbox("err", tmp_path / "workspace")
+    agent = Agent(sandbox, _BadReadProvider(), "err", tmp_path / "sessions")
+
+    try:
+        events = [event async for event in agent.turn("Read the missing file")]
+    finally:
+        await sandbox.close()
+
+    tool_results = [event for event in events if event["type"] == "tool_result"]
+    assert tool_results and "error" in tool_results[0]
+    assert any(event["type"] == "assistant_message" for event in events)
+    assert not any(event["type"] == "error" for event in events)
+    assert events[-1]["type"] == "done"
