@@ -264,8 +264,9 @@ the gateway binding all interfaces — carry inline `# noqa` / `# nosec` /
 - **frontend** — `npm ci`, typecheck, and production build
 - **security** — semgrep plus a full-history gitleaks secret scan
 - **actionlint** — lints the workflow files themselves
-- **e2e** — the Playwright suite against real Docker sandboxes; nightly and
-  manual only, too slow for PR gating
+- **e2e** — the Playwright suite against real Docker sandboxes with the mock
+  provider (no LLM calls); manual only via the Actions tab, too slow for PR
+  gating
 
 Third-party actions and images are pinned by commit SHA or digest. Merging to
 `main` requires the four fast checks to pass (branch protection).
