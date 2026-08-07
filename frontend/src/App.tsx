@@ -693,9 +693,21 @@ export default function App() {
             {sidebarOpen ? <ChevronLeftIcon /> : <LayoutPanelLeft size={16} />}
           </button>
         )}
-        <PanelGroup direction="horizontal" className="main-panels">
+        <PanelGroup
+          // Remount the group on any layout-mode change. With conditionally
+          // rendered panels, react-resizable-panels re-evaluates constraint props
+          // (maxSize) against registered panels in a layout effect that races
+          // panel registration and crashes with "Previous layout not found for
+          // panel index -1". A fresh group per mode keeps every instance static;
+          // the id/order props above keep panel identity explicit regardless.
+          key={canvasFullscreen ? 'full' : canvasMinimized ? 'chat-only' : chatMinimized ? 'canvas-only' : 'split'}
+          direction="horizontal"
+          className="main-panels"
+        >
           {!canvasFullscreen && !chatMinimized && (
             <Panel
+              id="chat"
+              order={1}
               defaultSize={canvasMinimized ? 100 : 35}
               minSize={28}
               // As the only panel the chat must be allowed to fill the space.
@@ -739,12 +751,20 @@ export default function App() {
             </button>
           )}
           {!canvasFullscreen && !chatMinimized && !canvasMinimized && (
-            <PanelResizeHandle className="resize-handle">
+            <PanelResizeHandle id="chat-canvas-handle" className="resize-handle">
               <span />
             </PanelResizeHandle>
           )}
           {!canvasMinimized && (
-            <Panel defaultSize={65} minSize={35} className="canvas-panel">
+            <Panel
+              id="canvas"
+              order={2}
+              // A solo panel must default to 100 or the group logs an invalid
+              // layout total and normalizes anyway.
+              defaultSize={canvasFullscreen || chatMinimized ? 100 : 65}
+              minSize={35}
+              className="canvas-panel"
+            >
               <Canvas
                 sessionId={sessionId}
                 artifact={artifact}
