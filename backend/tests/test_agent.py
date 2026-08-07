@@ -467,8 +467,13 @@ class ReportWithoutPdfProvider:
 
 
 @pytest.mark.asyncio
-async def test_report_request_explains_why_no_pdf_reached_the_canvas(tmp_path: Path):
+async def test_report_request_explains_why_no_pdf_reached_the_canvas(
+    tmp_path: Path, monkeypatch
+):
     sandbox = FakeSandbox("report-no-pdf", tmp_path / "workspace")
+    # Point the fallback PDF writer at a missing directory so the write fails
+    # and the turn has to explain itself with the real kernel error.
+    monkeypatch.setenv("SANDBOX_WORKSPACE", str(tmp_path / "missing"))
     agent = Agent(
         sandbox,
         ReportWithoutPdfProvider(),
@@ -484,7 +489,8 @@ async def test_report_request_explains_why_no_pdf_reached_the_canvas(tmp_path: P
     assert not any(event["type"] == "artifact" for event in events)
     message = next(event for event in events if event["type"] == "assistant_message")
     assert "could not put a PDF on the canvas" in message["content"]
-    assert "no PDF artifact was found" in message["content"]
+    assert "fallback PDF generator failed" in message["content"]
+    assert "FileNotFoundError" in message["content"]
 
 
 def run_pdf_rescue(workspace: Path, working_directory: Path, monkeypatch) -> None:
@@ -717,6 +723,69 @@ async def test_fallback_pdf_generated_when_provider_omits_pdf(tmp_path: Path):
     pdf_path = sandbox.root / "report.pdf"
     assert pdf_path.exists()
     assert pdf_path.read_bytes().startswith(b"%PDF-")
+
+
+class ClobberingNoPdfProvider:
+    """Runs analysis, clobbers the WORKSPACE global, never writes a PDF."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def stream(self, messages, tools):
+        self.calls += 1
+        if self.calls == 1:
+            yield {
+                "tool": "run_python",
+                "arguments": {"code": "WORKSPACE = '/app'\nprint('rows: 150')"},
+            }
+        elif self.calls == 2:
+            yield "Analysis complete."
+
+
+@pytest.mark.asyncio
+async def test_fallback_pdf_survives_clobbered_workspace(tmp_path: Path, monkeypatch):
+    """Agent code can reassign WORKSPACE; the fallback must use the real one."""
+    sandbox = FakeSandbox("clobber", tmp_path / "workspace")
+    monkeypatch.setenv("SANDBOX_WORKSPACE", str(sandbox.root))
+    agent = Agent(sandbox, ClobberingNoPdfProvider(), "clobber", tmp_path / "sessions")
+
+    try:
+        events = [event async for event in agent.turn("Create a report")]
+    finally:
+        await sandbox.close()
+
+    artifact = next(event for event in events if event["type"] == "artifact")
+    assert artifact["name"] == "report.pdf"
+    assert (sandbox.root / "report.pdf").read_bytes().startswith(b"%PDF-")
+
+
+class SilentNoPdfProvider:
+    """One tool call with no output, then no further content at all."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def stream(self, messages, tools):
+        self.calls += 1
+        if self.calls == 1:
+            yield {"tool": "run_python", "arguments": {"code": "x = 1"}}
+        # Round two yields nothing: no text, no tool calls.
+
+
+@pytest.mark.asyncio
+async def test_fallback_pdf_generated_even_without_any_text(tmp_path: Path):
+    """A report request must produce a PDF even when the provider says nothing."""
+    sandbox = FakeSandbox("silent", tmp_path / "workspace")
+    agent = Agent(sandbox, SilentNoPdfProvider(), "silent", tmp_path / "sessions")
+
+    try:
+        events = [event async for event in agent.turn("Create a report")]
+    finally:
+        await sandbox.close()
+
+    artifact = next(event for event in events if event["type"] == "artifact")
+    assert artifact["name"] == "report.pdf"
+    assert (sandbox.root / "report.pdf").read_bytes().startswith(b"%PDF-")
 
 
 @pytest.mark.asyncio

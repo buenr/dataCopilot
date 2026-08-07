@@ -177,7 +177,8 @@ register_artifact with the PDF filename and type "pdf". WORKSPACE is already
 defined for you; never reassign it, and never substitute os.getcwd() for it.
 Only files inside the workspace can be previewed or downloaded, so do not save
 the only copy under /mnt/data or /tmp, and do not claim completion without
-registering the PDF artifact.
+registering the PDF artifact. Keep exploration to one or two steps, then write
+and register the PDF right away so a step limit cannot cut the report off.
 
 For chart or visualization requests, compute the chart from the uploaded data
 and save it as a PNG or SVG inside the workspace (for example,
@@ -746,9 +747,12 @@ class Agent:
         content_b64 = base64.b64encode(content.encode()).decode()
         return '''
 import base64
+import os
 from pathlib import Path
 
-workspace = Path(WORKSPACE)
+# The kernel preloads WORKSPACE, but agent code can clobber it; the sandbox
+# image always sets SANDBOX_WORKSPACE, so prefer it (same as the rescue sweep).
+workspace = Path(os.environ.get("SANDBOX_WORKSPACE") or WORKSPACE)
 content = base64.b64decode("''' + content_b64 + '''").decode()
 
 lines = content.split("\\n")[:35]
@@ -780,6 +784,17 @@ pdf.extend(b"trailer\\n<< /Size " + str(len(objects) + 1).encode() + b" /Root 1 
 (workspace / "report.pdf").write_bytes(bytes(pdf))
 print("Fallback PDF written")
 '''
+
+    @staticmethod
+    def _dataset_summary_text(profiles: list[dict[str, Any]] | None) -> str:
+        """Minimal report content when a provider produced no text at all."""
+        lines = ["Data Copilot report", ""]
+        for profile in profiles or []:
+            lines.append(
+                f"{profile.get('name', 'dataset')} ({profile.get('file', 'unknown')}): "
+                f"{profile.get('rows', '?')} rows x {profile.get('columns', '?')} columns"
+            )
+        return "\n".join(lines)
 
     async def _recover_pdf_artifact(
         self, fallback_content: str = ""
@@ -819,14 +834,20 @@ print("Fallback PDF written")
             if not pdf_path and not hasattr(self.dispatcher.sandbox, "root"):
                 await self.dispatcher.dispatch("run_python", {"code": PDF_RESCUE_CODE})
                 pdf_path = await find_pdf()
-            if not pdf_path and fallback_content:
+            fallback_result: dict[str, Any] = {}
+            if not pdf_path:
                 # The provider ran analysis but never wrote a PDF. Build one
                 # from the collected output so the canvas is not empty.
-                await self.dispatcher.dispatch(
+                fallback_result = await self.dispatcher.dispatch(
                     "run_python", {"code": self._fallback_pdf_code(fallback_content)}
                 )
                 pdf_path = await find_pdf()
             if not pdf_path:
+                # run_python reports code failures as stderr, not exceptions, so
+                # surface the real reason instead of a generic "not found".
+                stderr = str(fallback_result.get("stderr") or "").strip()
+                if stderr:
+                    return None, f"the fallback PDF generator failed: {stderr.splitlines()[-1]}"
                 return None, "no PDF artifact was found in the sandbox workspace"
             artifact_result = await self.dispatcher.dispatch(
                 "register_artifact",
@@ -1198,7 +1219,9 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
             started_ports: dict[int, str] = {}
             all_text: list[str] = []
             run_python_outputs: list[str] = []
-            for _ in range(4):
+            # Eight rounds give slower providers room to explore and still write
+            # the artifact; the fallback below covers turns that exhaust it.
+            for _ in range(8):
                 text_parts: list[str] = []
                 tool_calls: list[tuple[str, str, dict[str, Any], dict[str, Any]]] = []
                 async for item in self.provider.stream(request_messages, TOOL_DEFINITIONS):
@@ -1351,6 +1374,10 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
                     )
             if report_request and not renderable_artifact:
                 fallback_content = "\n\n".join(all_text or run_python_outputs)
+                if not fallback_content:
+                    # The provider hit the step cap without saying anything;
+                    # fall back to a dataset summary so the PDF still has content.
+                    fallback_content = self._dataset_summary_text(dataset_profiles)
                 recovered, recovery_error = await self._recover_pdf_artifact(
                     fallback_content
                 )
