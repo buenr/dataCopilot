@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import {
   AlertCircle,
   ArrowUp,
@@ -1110,7 +1111,7 @@ function Message({ message }: { message: WorkbenchState['messages'][number] }) {
           <span>{new Date(message.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
         </div>
         <div className={`message-text ${isAssistant ? 'markdown-body' : ''}`}>
-          {isAssistant ? <ReactMarkdown>{message.content}</ReactMarkdown> : message.content}
+          {isAssistant ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown> : message.content}
           {message.streaming && <span className="stream-caret" />}
         </div>
       </div>
