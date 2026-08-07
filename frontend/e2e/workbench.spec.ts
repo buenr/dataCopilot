@@ -48,6 +48,29 @@ test('a user can upload data and receive a live dashboard and a PDF report', asy
   await expectMockDashboardInCanvas(page);
 });
 
+test('canvas and chat panels survive minimize and expand cycles', async ({ page }) => {
+  // Regression: conditionally rendered panels used to crash react-resizable-panels
+  // ("Previous layout not found for panel index -1") and blank the whole app.
+  const pageErrors: string[] = [];
+  page.on('pageerror', (error) => pageErrors.push(String(error)));
+  await openWorkbench(page);
+
+  await page.getByRole('button', { name: 'Minimize canvas panel' }).click();
+  await page.getByRole('button', { name: 'Expand canvas panel' }).click();
+  await expect(page.getByRole('heading', { name: 'Your canvas is ready' })).toBeVisible();
+
+  await page.getByRole('button', { name: 'Minimize chat panel' }).click();
+  await page.getByRole('button', { name: 'Expand chat panel' }).click();
+
+  await page.getByRole('button', { name: 'Enter full screen' }).click();
+  await page.getByRole('button', { name: 'Exit full screen' }).click();
+
+  // Both panels are back and the app never unmounted.
+  await expect(page.getByRole('button', { name: 'Minimize canvas panel' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Minimize chat panel' })).toBeVisible();
+  expect(pageErrors).toEqual([]);
+});
+
 test('a browser refresh restores the chat and canvas artifacts', async ({ page }) => {
   await openWorkbench(page);
   await uploadSampleDataset(page);
