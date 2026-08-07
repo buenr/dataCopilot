@@ -101,10 +101,39 @@ async def test_agent_returns_tool_results_to_provider_once(tmp_path: Path):
     events = [event async for event in agent.turn("Calculate the average revenue")]
 
     assert provider.calls == 2
-    assert any(event["type"] == "execution" and "1190.0" in event["stdout"] for event in events)
+    assert any(
+        event["type"] == "execution" and event.get("status") == "running" and "1190.0" in event.get("data", "")
+        for event in events
+    )
     assert any(event["type"] == "assistant_message" and "1190.0" in event["content"] for event in events)
     trajectory = (tmp_path / "sessions" / "loop" / "trajectory.jsonl").read_text()
     assert trajectory.count('"type": "tool_start"') == 1
+
+
+class SetVariableProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def stream(self, messages, tools):
+        self.calls += 1
+        if self.calls == 1:
+            yield {"tool": "run_python", "call_id": "call-1", "arguments": {"code": "answer = 41"}}
+        else:
+            yield "Done."
+
+
+@pytest.mark.asyncio
+async def test_execution_event_includes_kernel_variables(tmp_path: Path):
+    sandbox = FakeSandbox("vars", tmp_path / "workspace")
+    agent = Agent(sandbox, SetVariableProvider(), "vars", tmp_path / "sessions")
+
+    events = [event async for event in agent.turn("Set a variable")]
+
+    execution = next(event for event in events if event["type"] == "execution" and event.get("status") == "complete")
+    variables = {variable["name"]: variable for variable in execution["variables"]}
+    assert variables["answer"]["type"] == "int"
+    assert variables["answer"]["value"] == "41"
+    assert all(not name.startswith("_") for name in variables)
 
 
 class DashboardSourceOnlyProvider:
@@ -438,8 +467,13 @@ class ReportWithoutPdfProvider:
 
 
 @pytest.mark.asyncio
-async def test_report_request_explains_why_no_pdf_reached_the_canvas(tmp_path: Path):
+async def test_report_request_explains_why_no_pdf_reached_the_canvas(
+    tmp_path: Path, monkeypatch
+):
     sandbox = FakeSandbox("report-no-pdf", tmp_path / "workspace")
+    # Point the fallback PDF writer at a missing directory so the write fails
+    # and the turn has to explain itself with the real kernel error.
+    monkeypatch.setenv("SANDBOX_WORKSPACE", str(tmp_path / "missing"))
     agent = Agent(
         sandbox,
         ReportWithoutPdfProvider(),
@@ -455,7 +489,8 @@ async def test_report_request_explains_why_no_pdf_reached_the_canvas(tmp_path: P
     assert not any(event["type"] == "artifact" for event in events)
     message = next(event for event in events if event["type"] == "assistant_message")
     assert "could not put a PDF on the canvas" in message["content"]
-    assert "no PDF artifact was found" in message["content"]
+    assert "fallback PDF generator failed" in message["content"]
+    assert "FileNotFoundError" in message["content"]
 
 
 def run_pdf_rescue(workspace: Path, working_directory: Path, monkeypatch) -> None:
@@ -590,3 +625,215 @@ async def test_run_with_retries_still_retries_bare_failures(tmp_path: Path):
 
     assert "RuntimeError" in execution.stderr
     assert (sandbox.root / "attempts.txt").read_text() == "xxxx"  # initial run + 3 retries
+
+
+class PrintAndSetProvider:
+    """One round: run_python that prints and sets a variable, then wrap-up text."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def stream(self, messages, tools):
+        self.calls += 1
+        if self.calls == 1:
+            yield {"tool": "run_python", "call_id": "call-1", "arguments": {"code": "answer = 42\nprint(answer)"}}
+        else:
+            yield "Done."
+
+
+@pytest.mark.asyncio
+async def test_streaming_events_emit_code_then_deltas_then_complete_without_stdout(tmp_path: Path):
+    sandbox = FakeSandbox("stream-order", tmp_path / "workspace")
+    agent = Agent(sandbox, PrintAndSetProvider(), "stream-order", tmp_path / "sessions")
+
+    events = [event async for event in agent.turn("Compute and print")]
+    exec_events = [event for event in events if event["type"] == "execution"]
+
+    # 1. An initial "running" event publishes the code before the cell runs.
+    assert exec_events[0]["status"] == "running"
+    assert "answer = 42" in exec_events[0].get("code", "")
+
+    # 2. Streaming deltas carry the printed output.
+    deltas = [event for event in exec_events if event.get("stream") and event.get("data")]
+    assert len(deltas) >= 1
+    assert any("42" in event["data"] for event in deltas)
+
+    # 3. The "complete" event carries variables but not the already-streamed stdout.
+    complete = next(event for event in exec_events if event.get("status") == "complete")
+    assert "variables" in complete
+    assert any(v["name"] == "answer" for v in complete["variables"])
+    assert "stdout" not in complete
+    assert "stderr" not in complete
+
+
+def test_report_request_detects_whitepaper_with_long_parenthetical():
+    """Regression: a 31-char gap between verb and 'whitepaper' was not detected."""
+    assert Agent._is_report_request(
+        "create a (insightful but funny tone) whitepaper with analysis of how each player did"
+    )
+    assert Agent._is_report_request("create a whitepaper")
+    assert Agent._is_report_request("write a PDF report")
+    assert Agent._is_report_request("generate a report")
+    assert not Agent._is_report_request("build a dashboard")
+    assert not Agent._is_report_request("what does the report say")
+
+
+class AnalysisNoPdfProvider:
+    """Provider that runs analysis but never writes a PDF or calls register_artifact."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def stream(self, messages, tools):
+        self.calls += 1
+        if self.calls == 1:
+            yield {
+                "tool": "run_python",
+                "arguments": {"code": "print('Player A: 28 pts, 12 ast\\nPlayer B: 24 pts, 8 reb')"},
+            }
+        elif self.calls == 2:
+            yield "Analysis complete. Player A leads in scoring and assists."
+
+
+@pytest.mark.asyncio
+async def test_fallback_pdf_generated_when_provider_omits_pdf(tmp_path: Path):
+    """When the LLM analyzes data but never writes a PDF, the agent builds one."""
+    sandbox = FakeSandbox("fallback-pdf", tmp_path / "workspace")
+    agent = Agent(
+        sandbox,
+        AnalysisNoPdfProvider(),
+        "fallback-pdf",
+        tmp_path / "sessions",
+    )
+
+    try:
+        events = [event async for event in agent.turn("Create a whitepaper with analysis")]
+    finally:
+        await sandbox.close()
+
+    artifact = next(event for event in events if event["type"] == "artifact")
+    assert artifact["name"] == "report.pdf"
+    assert artifact["artifact"]["type"] == "pdf"
+    assert any(
+        event["type"] == "assistant_message"
+        and "ready in the canvas" in event["content"]
+        for event in events
+    )
+    # The fallback PDF must be a valid PDF file in the workspace.
+    pdf_path = sandbox.root / "report.pdf"
+    assert pdf_path.exists()
+    assert pdf_path.read_bytes().startswith(b"%PDF-")
+
+
+class ClobberingNoPdfProvider:
+    """Runs analysis, clobbers the WORKSPACE global, never writes a PDF."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def stream(self, messages, tools):
+        self.calls += 1
+        if self.calls == 1:
+            yield {
+                "tool": "run_python",
+                "arguments": {"code": "WORKSPACE = '/app'\nprint('rows: 150')"},
+            }
+        elif self.calls == 2:
+            yield "Analysis complete."
+
+
+@pytest.mark.asyncio
+async def test_fallback_pdf_survives_clobbered_workspace(tmp_path: Path, monkeypatch):
+    """Agent code can reassign WORKSPACE; the fallback must use the real one."""
+    sandbox = FakeSandbox("clobber", tmp_path / "workspace")
+    monkeypatch.setenv("SANDBOX_WORKSPACE", str(sandbox.root))
+    agent = Agent(sandbox, ClobberingNoPdfProvider(), "clobber", tmp_path / "sessions")
+
+    try:
+        events = [event async for event in agent.turn("Create a report")]
+    finally:
+        await sandbox.close()
+
+    artifact = next(event for event in events if event["type"] == "artifact")
+    assert artifact["name"] == "report.pdf"
+    assert (sandbox.root / "report.pdf").read_bytes().startswith(b"%PDF-")
+
+
+class SilentNoPdfProvider:
+    """One tool call with no output, then no further content at all."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def stream(self, messages, tools):
+        self.calls += 1
+        if self.calls == 1:
+            yield {"tool": "run_python", "arguments": {"code": "x = 1"}}
+        # Round two yields nothing: no text, no tool calls.
+
+
+@pytest.mark.asyncio
+async def test_fallback_pdf_generated_even_without_any_text(tmp_path: Path):
+    """A report request must produce a PDF even when the provider says nothing."""
+    sandbox = FakeSandbox("silent", tmp_path / "workspace")
+    agent = Agent(sandbox, SilentNoPdfProvider(), "silent", tmp_path / "sessions")
+
+    try:
+        events = [event async for event in agent.turn("Create a report")]
+    finally:
+        await sandbox.close()
+
+    artifact = next(event for event in events if event["type"] == "artifact")
+    assert artifact["name"] == "report.pdf"
+    assert (sandbox.root / "report.pdf").read_bytes().startswith(b"%PDF-")
+
+
+@pytest.mark.asyncio
+async def test_mock_explore_request_returns_grounded_summary(tmp_path: Path):
+    """The welcome screen's 'Explore my data' suggestion must not dead-end."""
+    sandbox = FakeSandbox("explore", tmp_path / "workspace")
+    profiles = [
+        {
+            "name": "df_1",
+            "file": "sales.csv",
+            "rows": 4,
+            "columns": 2,
+            "numeric_stats": {},
+        }
+    ]
+    agent = Agent(
+        sandbox,
+        MockProvider(),
+        "explore",
+        tmp_path / "sessions",
+        dataset_context=lambda: profiles,
+    )
+
+    try:
+        events = [event async for event in agent.turn("Explore my data")]
+    finally:
+        await sandbox.close()
+
+    message = next(event["content"] for event in events if event["type"] == "assistant_message")
+    assert "sales.csv" in message
+    assert "I can analyze" not in message
+
+
+@pytest.mark.asyncio
+async def test_mock_chart_request_registers_image_artifact(tmp_path: Path):
+    sandbox = FakeSandbox("chart", tmp_path / "workspace")
+    await sandbox.upload("data/sales.csv", b"region,revenue\nNorth,1200\nSouth,950\n")
+    await sandbox.exec("import pandas as pd\ndf_1 = pd.read_csv(WORKSPACE / 'data/sales.csv')")
+    agent = Agent(sandbox, MockProvider(), "chart", tmp_path / "sessions")
+
+    try:
+        events = [event async for event in agent.turn("Show me a chart of the data")]
+    finally:
+        await sandbox.close()
+
+    artifact = next(event for event in events if event["type"] == "artifact")
+    assert artifact["name"] == "chart.svg"
+    assert artifact["artifact"]["type"] == "image"
+    svg = (tmp_path / "workspace" / "chart.svg").read_text()
+    assert svg.startswith("<svg")
+    assert "revenue" in svg

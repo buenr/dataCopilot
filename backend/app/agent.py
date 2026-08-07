@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import re
@@ -11,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Protocol
 
-from .sandbox import Execution, Sandbox
+from .sandbox import EventCallback, Execution, Sandbox
 
 TOOLS = {"run_python", "write_file", "read_file", "list_files", "start_webapp", "stop_webapp", "register_artifact"}
 PROVIDER_WORKSPACE = "/home/oai/share"
@@ -136,7 +137,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "type": "object",
                 "properties": {
                     "name": {"type": "string"},
-                    "type": {"type": "string", "enum": ["webapp", "pdf", "document"]},
+                    "type": {"type": "string", "enum": ["webapp", "pdf", "document", "image"]},
                     "port": {"type": "integer"},
                 },
                 "required": ["name"],
@@ -176,7 +177,13 @@ register_artifact with the PDF filename and type "pdf". WORKSPACE is already
 defined for you; never reassign it, and never substitute os.getcwd() for it.
 Only files inside the workspace can be previewed or downloaded, so do not save
 the only copy under /mnt/data or /tmp, and do not claim completion without
-registering the PDF artifact.
+registering the PDF artifact. Keep exploration to one or two steps, then write
+and register the PDF right away so a step limit cannot cut the report off.
+
+For chart or visualization requests, compute the chart from the uploaded data
+and save it as a PNG or SVG inside the workspace (for example,
+Path(WORKSPACE) / "chart.png"), then call register_artifact with the filename
+and type "image" so it renders on the canvas.
 """
     if not dataset_profiles:
         return prompt + "\nNo dataset has been uploaded yet."
@@ -266,7 +273,10 @@ class MockProvider:
         elif "pdf" in prompt or "report" in prompt or "whitepaper" in prompt:
             yield {"tool": "run_python", "arguments": {"code": pdf_code()}}
             yield {"tool": "register_artifact", "arguments": {"name": "report.pdf", "type": "pdf"}}
-        elif any(term in prompt for term in ("executive summary", "summary", "insight", "analy")):
+        elif any(term in prompt for term in ("chart", "graph", "plot", "visuali")):
+            yield {"tool": "run_python", "arguments": {"code": chart_code()}}
+            yield {"tool": "register_artifact", "arguments": {"name": "chart.svg", "type": "image"}}
+        elif any(term in prompt for term in ("executive summary", "summary", "insight", "analy", "explore")):
             yield mock_executive_summary(messages)
         else:
             yield "I can analyze the uploaded data, build a dashboard, or write a PDF report."
@@ -311,6 +321,41 @@ xref = len(pdf); pdf.extend(f"xref\n0 {len(objects)+1}\n0000000000 65535 f \n".e
 for offset in offsets[1:]: pdf.extend(f"{offset:010d} 00000 n \n".encode())
 pdf.extend(f"trailer\n<< /Size {len(objects)+1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode())
 (workspace / "report.pdf").write_bytes(pdf)
+"""
+
+
+def chart_code() -> str:
+    # Dependency-free SVG bar chart so the offline mock needs no matplotlib.
+    return r"""from pathlib import Path
+import html
+workspace = Path(WORKSPACE)
+frame = globals().get("df_1")
+means = []
+if frame is not None:
+    numeric = frame.select_dtypes(include="number")
+    for name, value in numeric.mean().head(8).items():
+        value = float(value)
+        if value == value:  # drop NaN averages
+            means.append((str(name), value))
+top = max((abs(value) for _, value in means), default=0.0) or 1.0
+bars = [(name, value, max(4, round(260 * abs(value) / top))) for name, value in means]
+if not bars:
+    bars = [("no numeric columns", 0.0, 4)]
+width = 80 + 110 * len(bars)
+parts = [
+    f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="380" font-family="system-ui, sans-serif">',
+    '<rect width="100%" height="100%" fill="#ffffff"/>',
+    '<text x="24" y="36" font-size="18" font-weight="700" fill="#0f172a">Column averages</text>',
+]
+for i, (name, value, height) in enumerate(bars):
+    x = 40 + 110 * i
+    y = 320 - height
+    label = html.escape(name if len(name) <= 12 else name[:11] + "...")
+    parts.append(f'<rect x="{x}" y="{y}" width="70" height="{height}" rx="6" fill="#2563eb"/>')
+    parts.append(f'<text x="{x + 35}" y="{y - 8}" font-size="12" text-anchor="middle" fill="#334155">{value:,.1f}</text>')
+    parts.append(f'<text x="{x + 35}" y="342" font-size="11" text-anchor="middle" fill="#64748b">{label}</text>')
+parts.append("</svg>")
+(workspace / "chart.svg").write_text("\n".join(parts), encoding="utf-8")
 """
 
 
@@ -587,12 +632,17 @@ class ToolDispatcher:
             index += 1
         return shlex.join(normalized)
 
-    async def dispatch(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    async def dispatch(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        on_event: EventCallback | None = None,
+    ) -> dict[str, Any]:
         if name not in TOOLS:
             raise ValueError(f"unknown tool: {name}")
         self.record({"type": "tool_start", "tool": name, "arguments": {k: v for k, v in arguments.items() if k != "content"}})
         if name == "run_python":
-            execution = await self._run_with_retries(str(arguments.get("code", "")))
+            execution = await self._run_with_retries(str(arguments.get("code", "")), on_event)
             result = {
                 "stdout": execution.stdout,
                 "stderr": execution.stderr,
@@ -630,8 +680,8 @@ class ToolDispatcher:
         self.record({"type": "tool_result", "tool": name, "result": result})
         return result
 
-    async def _run_with_retries(self, code: str) -> Execution:
-        execution = await self.sandbox.exec(code)
+    async def _run_with_retries(self, code: str, on_event: EventCallback | None = None) -> Execution:
+        execution = await self.sandbox.exec(code, on_event)
         retries = 0
         # Retry only a bare failure (stderr with no stdout and no result), the
         # signature of a transient kernel error. Code that already produced
@@ -639,7 +689,7 @@ class ToolDispatcher:
         # and re-running would duplicate side effects such as file writes.
         while execution.stderr and not execution.stdout and execution.result is None and retries < 3:
             retries += 1
-            execution = await self.sandbox.exec(code)
+            execution = await self.sandbox.exec(code, on_event)
         return execution
 
 
@@ -651,11 +701,14 @@ class Agent:
         session_id: str,
         sessions_dir: str | Path = "sessions",
         dataset_context: Callable[[], list[dict[str, Any]]] | None = None,
+        history: list[dict[str, Any]] | None = None,
     ):
         self.provider = provider
         self.dispatcher = ToolDispatcher(sandbox, session_id, Path(sessions_dir))
         self.dataset_context = dataset_context or (lambda: [])
-        self.messages: list[dict[str, Any]] = []
+        # A caller can own the transcript (the gateway keeps it on the session) so
+        # conversation memory survives a reconnect, which builds a new Agent.
+        self.messages: list[dict[str, Any]] = history if history is not None else []
 
     @staticmethod
     def _is_dashboard_request(content: str) -> bool:
@@ -665,11 +718,14 @@ class Agent:
     @staticmethod
     def _is_report_request(content: str) -> bool:
         lowered = content.lower()
-        if "pdf" in lowered or lowered.strip() in {"report", "whitepaper"}:
+        # "whitepaper" and "pdf" are strong signals on their own; "report" needs
+        # an action verb nearby to avoid matching e.g. "what does the report say".
+        if "pdf" in lowered or "whitepaper" in lowered:
+            return True
+        if lowered.strip() == "report":
             return True
         return re.search(
-            r"\b(?:create|generate|write|build|make|produce|export|draft)\b.{0,30}"
-            r"\b(?:report|whitepaper)\b",
+            r"\b(?:create|generate|write|build|make|produce|export|draft)\b.{0,60}\breport\b",
             lowered,
         ) is not None
 
@@ -678,8 +734,76 @@ class Agent:
         path = str(artifact.get("path") or artifact.get("name") or "").lower()
         return artifact.get("type") == "pdf" or path.endswith(".pdf")
 
-    async def _recover_pdf_artifact(self) -> tuple[dict[str, Any] | None, str | None]:
-        """Recover a PDF when a provider wrote it but omitted the handoff."""
+    @staticmethod
+    def _fallback_pdf_code(content: str) -> str:
+        """Return sandbox code that builds a simple PDF from analysis text.
+
+        Dependency-free (same raw-PDF approach as the mock provider) so it
+        works in both the Docker sandbox and the in-process FakeSandbox.
+        Content is base64-encoded to avoid all escaping issues.
+        """
+        import base64
+
+        content_b64 = base64.b64encode(content.encode()).decode()
+        return '''
+import base64
+import os
+from pathlib import Path
+
+# The kernel preloads WORKSPACE, but agent code can clobber it; the sandbox
+# image always sets SANDBOX_WORKSPACE, so prefer it (same as the rescue sweep).
+workspace = Path(os.environ.get("SANDBOX_WORKSPACE") or WORKSPACE)
+content = base64.b64decode("''' + content_b64 + '''").decode()
+
+lines = content.split("\\n")[:35]
+objects = [
+    b"<< /Type /Catalog /Pages 2 0 R >>",
+    b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+]
+parts = []
+y = 700
+for line in lines:
+    esc = line.replace("\\\\", "\\\\\\\\").replace("(", "\\\\(").replace(")", "\\\\)")
+    parts.append("BT /F1 11 Tf 72 " + str(y) + " Td (" + esc + ") Tj ET")
+    y -= 16
+data = "\\n".join(parts).encode()
+objects.append(b"<< /Length " + str(len(data)).encode() + b" >>\\nstream\\n" + data + b"endstream")
+objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+
+pdf = bytearray(b"%PDF-1.4\\n")
+offsets = [0]
+for i, obj in enumerate(objects, 1):
+    offsets.append(len(pdf))
+    pdf.extend(str(i).encode() + b" 0 obj\\n" + obj + b"\\nendobj\\n")
+xref = len(pdf)
+pdf.extend(b"xref\\n0 " + str(len(objects) + 1).encode() + b"\\n0000000000 65535 f \\n")
+for off in offsets[1:]:
+    pdf.extend(str(off).zfill(10).encode() + b" 00000 n \\n")
+pdf.extend(b"trailer\\n<< /Size " + str(len(objects) + 1).encode() + b" /Root 1 0 R >>\\nstartxref\\n" + str(xref).encode() + b"\\n%%EOF\\n")
+(workspace / "report.pdf").write_bytes(bytes(pdf))
+print("Fallback PDF written")
+'''
+
+    @staticmethod
+    def _dataset_summary_text(profiles: list[dict[str, Any]] | None) -> str:
+        """Minimal report content when a provider produced no text at all."""
+        lines = ["Data Copilot report", ""]
+        for profile in profiles or []:
+            lines.append(
+                f"{profile.get('name', 'dataset')} ({profile.get('file', 'unknown')}): "
+                f"{profile.get('rows', '?')} rows x {profile.get('columns', '?')} columns"
+            )
+        return "\n".join(lines)
+
+    async def _recover_pdf_artifact(
+        self, fallback_content: str = ""
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Recover a PDF when a provider wrote it but omitted the handoff.
+
+        If no PDF exists after the rescue sweep, generate one from the
+        assistant's analysis text so the user always gets a canvas artifact.
+        """
         async def find_pdf() -> str | None:
             listing = await self.dispatcher.dispatch("list_files", {"path": "."})
             files = listing.get("files", [])
@@ -710,7 +834,20 @@ class Agent:
             if not pdf_path and not hasattr(self.dispatcher.sandbox, "root"):
                 await self.dispatcher.dispatch("run_python", {"code": PDF_RESCUE_CODE})
                 pdf_path = await find_pdf()
+            fallback_result: dict[str, Any] = {}
             if not pdf_path:
+                # The provider ran analysis but never wrote a PDF. Build one
+                # from the collected output so the canvas is not empty.
+                fallback_result = await self.dispatcher.dispatch(
+                    "run_python", {"code": self._fallback_pdf_code(fallback_content)}
+                )
+                pdf_path = await find_pdf()
+            if not pdf_path:
+                # run_python reports code failures as stderr, not exceptions, so
+                # surface the real reason instead of a generic "not found".
+                stderr = str(fallback_result.get("stderr") or "").strip()
+                if stderr:
+                    return None, f"the fallback PDF generator failed: {stderr.splitlines()[-1]}"
                 return None, "no PDF artifact was found in the sandbox workspace"
             artifact_result = await self.dispatcher.dispatch(
                 "register_artifact",
@@ -1039,6 +1176,33 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
                 return html_path[len(prefix):]
         return html_path
 
+    async def _dispatch(
+        self, name: str, arguments: dict[str, Any]
+    ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
+        """Dispatch a tool, forwarding kernel output while the code is still running.
+
+        Yields ``("event", output_event)`` zero or more times and always ends with
+        ``("result", tool_result)``. The sandbox reports output through a callback,
+        so a queue is what lets an async generator re-emit it as it arrives.
+        """
+        if name != "run_python":
+            yield "result", await self.dispatcher.dispatch(name, arguments)
+            return
+        queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+        task = asyncio.create_task(self.dispatcher.dispatch(name, arguments, queue.put_nowait))
+        task.add_done_callback(lambda _: queue.put_nowait(None))
+        try:
+            while True:
+                event = await queue.get()
+                if event is None:
+                    break
+                yield "event", event
+            yield "result", await task
+        finally:
+            # A cancelled turn (user pressed stop) must not leave the dispatch running.
+            if not task.done():
+                task.cancel()
+
     async def turn(self, content: str) -> AsyncIterator[dict[str, Any]]:
         self.messages.append({"role": "user", "content": content})
         self.dispatcher.record({"type": "user_message", "content": content})
@@ -1053,7 +1217,11 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
             report_request = self._is_report_request(content)
             renderable_artifact = False
             started_ports: dict[int, str] = {}
-            for _ in range(4):
+            all_text: list[str] = []
+            run_python_outputs: list[str] = []
+            # Eight rounds give slower providers room to explore and still write
+            # the artifact; the fallback below covers turns that exhaust it.
+            for _ in range(8):
                 text_parts: list[str] = []
                 tool_calls: list[tuple[str, str, dict[str, Any], dict[str, Any]]] = []
                 async for item in self.provider.stream(request_messages, TOOL_DEFINITIONS):
@@ -1070,11 +1238,48 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
                         "tool": item["tool"],
                         "input": arguments,
                     }
-                    tool_result = await self.dispatcher.dispatch(item["tool"], arguments)
+                    streamed = False
+                    if item["tool"] == "run_python":
+                        # Publish the code before it runs so the inspector is not
+                        # empty for the duration of the execution.
+                        yield {
+                            "type": "execution",
+                            "status": "running",
+                            "code": str(arguments.get("code", "")),
+                        }
+                    tool_result: dict[str, Any] = {}
+                    async for kind, chunk in self._dispatch(item["tool"], arguments):
+                        if kind == "result":
+                            tool_result = chunk
+                            continue
+                        data = chunk.get("data")
+                        if not isinstance(data, str) or not data:
+                            continue
+                        streamed = True
+                        yield {
+                            "type": "execution",
+                            "status": "running",
+                            "stream": str(chunk.get("type") or "stdout"),
+                            "data": data,
+                        }
                     tool_calls.append((provider_call_id, item["tool"], arguments, tool_result))
                     yield {"type": "tool_result", "id": tool_id, "tool": item["tool"], **tool_result}
                     if item["tool"] == "run_python":
-                        yield {"type": "execution", "status": "complete", **tool_result}
+                        stdout = str(tool_result.get("stdout", ""))
+                        if stdout.strip():
+                            run_python_outputs.append(stdout.strip())
+                        try:
+                            variables = await self.dispatcher.sandbox.vars()
+                        except Exception:
+                            # Variable inspection is best-effort and must never break a turn.
+                            variables = []
+                        completed = dict(tool_result)
+                        if streamed:
+                            # Output already reached the client incrementally; resending
+                            # the aggregate would duplicate it.
+                            completed.pop("stdout", None)
+                            completed.pop("stderr", None)
+                        yield {"type": "execution", "status": "complete", "variables": variables, **completed}
                     if item["tool"] == "start_webapp":
                         normalized_command = ToolDispatcher._normalize_webapp_command(
                             str(arguments.get("command", ""))
@@ -1137,6 +1342,8 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
                                 "artifact": artifact,
                             }
                 final_text = "".join(text_parts)
+                if final_text:
+                    all_text.append(final_text)
                 if not tool_calls:
                     break
                 request_messages.append(
@@ -1166,7 +1373,14 @@ table{{border-collapse:collapse;width:100%;font-size:13px}}th,td{{border-bottom:
                         }
                     )
             if report_request and not renderable_artifact:
-                recovered, recovery_error = await self._recover_pdf_artifact()
+                fallback_content = "\n\n".join(all_text or run_python_outputs)
+                if not fallback_content:
+                    # The provider hit the step cap without saying anything;
+                    # fall back to a dataset summary so the PDF still has content.
+                    fallback_content = self._dataset_summary_text(dataset_profiles)
+                recovered, recovery_error = await self._recover_pdf_artifact(
+                    fallback_content
+                )
                 if recovered:
                     self.dispatcher.record(
                         {"type": "artifact_recovered", "artifact": recovered}

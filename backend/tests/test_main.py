@@ -222,3 +222,169 @@ def test_chat_socket_survives_malformed_json(tmp_path: Path):
             socket.send_json({"type": "user_message", "content": "hello"})
             types = [socket.receive_json()["type"] for _ in range(4)]
             assert types == ["user_message", "assistant_delta", "assistant_message", "done"]
+
+
+def test_cancel_with_no_active_turn_sends_cancelled_and_done(tmp_path: Path):
+    from fastapi.testclient import TestClient
+
+    settings = Settings(sessions_dir=str(tmp_path / "sessions"), llm_provider="mock")
+    manager = SessionManager(
+        settings,
+        sandbox_factory=lambda sid: FakeSandbox(sid, tmp_path / "workspaces" / sid),
+    )
+    application = create_app(settings, manager)
+
+    with TestClient(application) as client:
+        session_id = client.post("/api/sessions").json()["id"]
+        with client.websocket_connect(f"/ws/sessions/{session_id}") as socket:
+            socket.receive_json()  # session_ready
+            # A cancel with nothing running still acks so the UI can settle.
+            socket.send_json({"type": "cancel"})
+            events = [socket.receive_json() for _ in range(2)]
+            assert events[0]["type"] == "cancelled"
+            assert events[1]["type"] == "done"
+            # The session remains usable after the cancel.
+            socket.send_json({"type": "user_message", "content": "hello"})
+            types = [socket.receive_json()["type"] for _ in range(4)]
+            assert types == ["user_message", "assistant_delta", "assistant_message", "done"]
+
+
+def test_session_resume_replays_transcript(tmp_path: Path):
+    from fastapi.testclient import TestClient
+
+    settings = Settings(sessions_dir=str(tmp_path / "sessions"), llm_provider="mock")
+    manager = SessionManager(
+        settings,
+        sandbox_factory=lambda sid: FakeSandbox(sid, tmp_path / "workspaces" / sid),
+    )
+    application = create_app(settings, manager)
+
+    with TestClient(application) as client:
+        session_id = client.post("/api/sessions").json()["id"]
+        # First connection: build up a transcript.
+        with client.websocket_connect(f"/ws/sessions/{session_id}") as socket:
+            ready = socket.receive_json()
+            assert ready["type"] == "session_ready"
+            assert ready["messages"] == []
+            socket.send_json({"type": "user_message", "content": "hello"})
+            while True:
+                event = socket.receive_json()
+                if event["type"] == "done":
+                    break
+        # Second connection: the transcript is replayed in session_ready.
+        with client.websocket_connect(f"/ws/sessions/{session_id}") as socket:
+            ready = socket.receive_json()
+            assert ready["type"] == "session_ready"
+            messages = ready["messages"]
+            assert any(m["role"] == "user" and "hello" in m["content"] for m in messages)
+            assert any(m["role"] == "assistant" for m in messages)
+
+
+@pytest.mark.asyncio
+async def test_dataset_delete_renumbers_remaining_frames(tmp_path: Path):
+    settings = Settings(sessions_dir=str(tmp_path / "sessions"))
+    manager = SessionManager(
+        settings,
+        sandbox_factory=lambda sid: FakeSandbox(sid, tmp_path / "workspaces" / sid),
+    )
+    application = create_app(settings, manager)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application),
+        base_url="http://test",
+    ) as client:
+        created = await client.post("/api/sessions")
+        session_id = created.json()["id"]
+        # Upload two datasets so the second is numbered df_2.
+        await client.post(
+            f"/api/sessions/{session_id}/files",
+            files=[
+                ("files", ("sales.csv", b"region,revenue\nNorth,1200\n", "text/csv")),
+                ("files", ("costs.csv", b"item,cost\nA,50\n", "text/csv")),
+            ],
+        )
+        # Delete the first; the remaining one must be renumbered to df_1.
+        response = await client.delete(f"/api/sessions/{session_id}/files/sales.csv")
+        assert response.status_code == 200
+        schemas = response.json()["schemas"]
+        assert len(schemas) == 1
+        assert schemas[0]["name"] == "df_1"
+        assert schemas[0]["file"] == "costs.csv"
+        # The kernel reflects the renumbering.
+        session = manager.get(session_id)
+        execution = await session.sandbox.exec("print(df_1['item'].iloc[0])")
+        assert execution.stdout.strip() == "A"
+
+
+@pytest.mark.asyncio
+async def test_delete_missing_dataset_returns_404(tmp_path: Path):
+    settings = Settings(sessions_dir=str(tmp_path / "sessions"))
+    manager = SessionManager(
+        settings,
+        sandbox_factory=lambda sid: FakeSandbox(sid, tmp_path / "workspaces" / sid),
+    )
+    application = create_app(settings, manager)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application),
+        base_url="http://test",
+    ) as client:
+        created = await client.post("/api/sessions")
+        session_id = created.json()["id"]
+        response = await client.delete(f"/api/sessions/{session_id}/files/nonexistent.csv")
+        assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_sample_data_endpoint_loads_bundled_datasets(tmp_path: Path):
+    sample_dir = tmp_path / "sample_data"
+    sample_dir.mkdir()
+    (sample_dir / "people.csv").write_text("name,score\nAda,10\nGrace,20\n")
+    settings = Settings(
+        sessions_dir=str(tmp_path / "sessions"),
+        sample_data_dir=str(sample_dir),
+    )
+    manager = SessionManager(
+        settings,
+        sandbox_factory=lambda sid: FakeSandbox(sid, tmp_path / "workspaces" / sid),
+    )
+    application = create_app(settings, manager)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application),
+        base_url="http://test",
+    ) as client:
+        created = await client.post("/api/sessions")
+        session_id = created.json()["id"]
+        response = await client.post(f"/api/sessions/{session_id}/sample-data")
+
+    assert response.status_code == 200
+    schema = response.json()["schemas"][0]
+    assert schema["file"] == "people.csv"
+    assert schema["rows"] == 2
+    session = manager.get(session_id)
+    execution = await session.sandbox.exec("print(df_1['score'].sum())")
+    assert execution.stdout.strip() == "30"
+
+
+@pytest.mark.asyncio
+async def test_sample_data_endpoint_404_when_nothing_bundled(tmp_path: Path):
+    settings = Settings(
+        sessions_dir=str(tmp_path / "sessions"),
+        sample_data_dir=str(tmp_path / "missing-sample-data"),
+    )
+    manager = SessionManager(
+        settings,
+        sandbox_factory=lambda sid: FakeSandbox(sid, tmp_path / "workspaces" / sid),
+    )
+    application = create_app(settings, manager)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application),
+        base_url="http://test",
+    ) as client:
+        created = await client.post("/api/sessions")
+        session_id = created.json()["id"]
+        response = await client.post(f"/api/sessions/{session_id}/sample-data")
+
+    assert response.status_code == 404

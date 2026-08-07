@@ -122,7 +122,9 @@ uv run uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8000
 cd frontend && npm run dev
 ```
 
-Open `http://localhost:5173`. The default `LLM_PROVIDER=mock` mode is
+Open `http://localhost:5173`. The Vite dev server proxies `/api` and `/ws` to
+the gateway on port 8000, so no `VITE_API_URL` configuration is needed and
+artifact downloads stay same-origin. The default `LLM_PROVIDER=mock` mode is
 deterministic and requires no API key. Set `LLM_PROVIDER=anthropic` or
 `openai` and provide the corresponding key to use a live provider.
 

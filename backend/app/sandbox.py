@@ -10,12 +10,16 @@ import subprocess
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
 import httpx
+
+# Called with {"type": "stdout"|"stderr"|"result", "data": str} while code runs.
+EventCallback = Callable[[dict[str, Any]], None]
 
 
 @dataclass
@@ -31,13 +35,16 @@ class Sandbox(Protocol):
     preview_ports: dict[int, int]
     preview_host: str
 
-    async def exec(self, code: str) -> Execution: ...
+    async def exec(self, code: str, on_event: EventCallback | None = None) -> Execution: ...
     async def upload(self, name: str, content: bytes) -> None: ...
     async def read_file(self, name: str) -> bytes: ...
+    async def delete_file(self, name: str) -> None: ...
     async def list_files(self, path: str = ".") -> list[dict[str, Any]]: ...
     async def start_webapp(self, command: str, port: int) -> int: ...
     async def stop_webapp(self, port: int) -> None: ...
     async def artifacts(self) -> list[dict[str, Any]]: ...
+    async def vars(self) -> list[dict[str, Any]]: ...
+    async def interrupt(self) -> bool: ...
     async def close(self) -> None: ...
 
 
@@ -53,7 +60,7 @@ class FakeSandbox:
         self._globals: dict[str, Any] = {"__name__": "__main__", "WORKSPACE": self.root}
         self._processes: dict[int, subprocess.Popen[Any]] = {}
 
-    async def exec(self, code: str) -> Execution:
+    async def exec(self, code: str, on_event: EventCallback | None = None) -> Execution:
         output, errors = io.StringIO(), io.StringIO()
         result: Any = None
         try:
@@ -62,11 +69,20 @@ class FakeSandbox:
                 exec(compiled, self._globals, self._globals)
         except Exception as exc:  # stderr is intentionally returned to agent for retry
             errors.write(f"{type(exc).__name__}: {exc}")
+        events: list[dict[str, Any]] = []
+        for name, text in (("stdout", output.getvalue()), ("stderr", errors.getvalue())):
+            if text:
+                events.append({"type": name, "data": text})
+        if on_event is not None:
+            # This sandbox runs code inline, so output can only be replayed once
+            # the cell finishes; the callback contract stays the same as Docker's.
+            for event in events:
+                on_event(event)
         return Execution(
             stdout=output.getvalue(),
             stderr=errors.getvalue(),
             result=result,
-            events=[{"type": "stdout", "data": output.getvalue()}] if output.getvalue() else [],
+            events=events,
         )
 
     async def upload(self, name: str, content: bytes) -> None:
@@ -80,6 +96,11 @@ class FakeSandbox:
         from .paths import safe_path
 
         return safe_path(self.root, name, allow_missing=False).read_bytes()
+
+    async def delete_file(self, name: str) -> None:
+        from .paths import safe_path
+
+        safe_path(self.root, name, allow_missing=False).unlink()
 
     async def list_files(self, path: str = ".") -> list[dict[str, Any]]:
         from .paths import safe_path
@@ -110,8 +131,29 @@ class FakeSandbox:
         return [
             {"name": path.name, "path": str(path.relative_to(self.root)), "size": path.stat().st_size}
             for path in self.root.rglob("*")
-            if path.is_file() and path.suffix.lower() in {".pdf", ".html", ".png", ".jpg", ".jpeg"}
+            if path.is_file() and path.suffix.lower() in {".pdf", ".html", ".png", ".jpg", ".jpeg", ".svg"}
         ]
+
+    async def vars(self) -> list[dict[str, Any]]:
+        import types
+
+        variables: list[dict[str, Any]] = []
+        for name in sorted(self._globals):
+            if name.startswith("_"):
+                continue
+            value = self._globals[name]
+            if isinstance(value, types.ModuleType) or callable(value):
+                continue
+            try:
+                rendered = repr(value)
+            except Exception:
+                rendered = "<unrepresentable>"
+            variables.append({"name": name, "type": type(value).__name__, "value": rendered[:120]})
+        return variables
+
+    async def interrupt(self) -> bool:
+        # Inline execution blocks the event loop, so there is nothing to interrupt.
+        return False
 
     async def close(self) -> None:
         for port in list(self._processes):
@@ -244,13 +286,52 @@ class DockerSandbox:
             response.raise_for_status()
             return response.json()
 
-    async def exec(self, code: str) -> Execution:
-        payload = await self._request("POST", "/exec", json={"code": code})
+    async def exec(self, code: str, on_event: EventCallback | None = None) -> Execution:
+        if on_event is None:
+            payload = await self._request("POST", "/exec", json={"code": code})
+            return Execution(
+                stdout=payload.get("stdout", ""),
+                stderr=payload.get("stderr", ""),
+                result=payload.get("result"),
+                events=payload.get("events", []),
+            )
+        stdout: list[str] = []
+        stderr: list[str] = []
+        events: list[dict[str, Any]] = []
+        summary: dict[str, Any] = {}
+        # No read timeout: output arrives as the cell runs, and a long silent
+        # computation is bounded by sandboxd's own per-message kernel timeout.
+        timeout = httpx.Timeout(None, connect=10.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream("POST", self._base_url + "/exec/stream", json={"code": code}) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if event.get("type") == "summary":
+                        summary = event.get("result", {})
+                        continue
+                    events.append(event)
+                    data = event.get("data")
+                    if isinstance(data, str) and data:
+                        kind = event.get("type")
+                        if kind == "stderr":
+                            stderr.append(data)
+                        elif kind == "stdout":
+                            stdout.append(data)
+                        # `result` reprs are worth showing live but are not stdout,
+                        # matching how the buffered endpoint reports them.
+                        on_event(event)
         return Execution(
-            stdout=payload.get("stdout", ""),
-            stderr=payload.get("stderr", ""),
-            result=payload.get("result"),
-            events=payload.get("events", []),
+            stdout=summary.get("stdout", "".join(stdout)),
+            stderr=summary.get("stderr", "".join(stderr)),
+            result=summary.get("result"),
+            events=summary.get("events", events),
         )
 
     async def upload(self, name: str, content: bytes) -> None:
@@ -261,6 +342,14 @@ class DockerSandbox:
             response = await client.get(self._base_url + "/files/" + name)
             response.raise_for_status()
             return response.content
+
+    async def delete_file(self, name: str) -> None:
+        try:
+            await self._request("DELETE", "/files/" + name)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                raise FileNotFoundError(name) from exc
+            raise
 
     async def list_files(self, path: str = ".") -> list[dict[str, Any]]:
         result = await self._request("GET", "/files", params={"path": path})
@@ -280,6 +369,14 @@ class DockerSandbox:
         result = await self._request("GET", "/artifacts")
         return result.get("artifacts", result)
 
+    async def vars(self) -> list[dict[str, Any]]:
+        result = await self._request("GET", "/vars")
+        return result.get("vars", [])
+
+    async def interrupt(self) -> bool:
+        result = await self._request("POST", "/interrupt")
+        return bool(result.get("interrupted"))
+
     async def close(self) -> None:
         try:
             self.container.remove(force=True)
@@ -297,6 +394,10 @@ class ManagedSession:
     last_activity: float
     status: str = "ready"
     dataset_profiles: list[dict[str, Any]] = field(default_factory=list)
+    # The transcript belongs to the session, not to a websocket: a page reload or
+    # dropped connection creates a new Agent that must keep the conversation.
+    messages: list[dict[str, Any]] = field(default_factory=list)
+    transcript: list[dict[str, Any]] = field(default_factory=list)
 
 
 class SessionManager:

@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     anthropic_model: str = "claude-sonnet-5"
     openai_model: str = "gpt-5.6"
     sessions_dir: str = "sessions"
+    # Bundled datasets the "Try sample data" button loads into a session.
+    sample_data_dir: str = "sample_data"
 
     model_config = SettingsConfigDict(
         env_file=".env",

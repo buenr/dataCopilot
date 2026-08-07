@@ -1,5 +1,5 @@
 export type ConnectionState = 'connecting' | 'connected' | 'offline' | 'error';
-export type CanvasTab = 'web' | 'document' | 'empty';
+export type CanvasTab = 'web' | 'document' | 'image' | 'empty';
 
 export type DatasetColumn = {
   name: string;
@@ -16,6 +16,7 @@ export type Dataset = {
   size?: string;
   variable?: string;
   schema: DatasetColumn[];
+  sampleRows?: Array<Record<string, unknown>>;
 };
 
 export type ChatMessage = {
@@ -43,7 +44,7 @@ export type ExecutionState = {
 };
 
 export type Artifact = {
-  type?: 'webapp' | 'pdf' | 'document';
+  type?: 'webapp' | 'pdf' | 'document' | 'image';
   name?: string;
   url?: string;
   port?: number;
