@@ -392,12 +392,13 @@ def sales_profile() -> list[dict]:
 
 
 @pytest.mark.asyncio
-async def test_dashboard_fallback_contains_profiled_values(tmp_path: Path):
-    sandbox = FakeSandbox("grounded", tmp_path / "workspace")
+async def test_placeholder_dashboard_is_served_as_written(tmp_path: Path):
+    """An empty-shell dashboard is the model's own output: publish it, never swap it."""
+    sandbox = FakeSandbox("placeholder", tmp_path / "workspace")
     agent = Agent(
         sandbox,
         DashboardPlaceholderProvider(),
-        "grounded",
+        "placeholder",
         tmp_path / "sessions",
         dataset_context=sales_profile,
     )
@@ -409,13 +410,10 @@ async def test_dashboard_fallback_contains_profiled_values(tmp_path: Path):
     finally:
         await sandbox.close()
 
-    assert artifact["name"] == "data_grounded_dashboard.html"
-    assert artifact["port"] == 8502
-    assert "4" in content
-    assert "1,172.50" in content
-    assert "950" in content
-    assert "Key insights" in content
-    assert "chart-row" in content
+    assert artifact["name"] == "dashboard.html"
+    assert artifact["port"] == 8501
+    assert "Analysis complete" in content
+    assert not (tmp_path / "workspace" / "data_grounded_dashboard.html").exists()
 
 
 @pytest.mark.asyncio
@@ -437,15 +435,6 @@ async def test_grounded_dashboard_is_preserved(tmp_path: Path):
     artifacts = [event for event in events if event["type"] == "artifact"]
     assert [artifact["name"] for artifact in artifacts] == ["dashboard.html"]
     assert artifacts[0]["port"] == 8501
-
-
-def test_dashboard_data_check_ignores_script_only_values():
-    html = (
-        "<h1>Sales</h1><script>const DATA = "
-        '{"file":"sales.csv","rows":4,"revenue":950,"mean":1172.5}</script>'
-    )
-
-    assert not Agent._dashboard_has_visible_data(html, sales_profile())
 
 
 def test_static_dashboard_preview_keeps_workspace_relative_html_path():
@@ -1088,6 +1077,24 @@ async def test_exhausted_report_turn_says_so_instead_of_faking_a_pdf(tmp_path: P
 
     assert not any(event["type"] == "artifact" for event in events)
     assert not (sandbox.root / "report.pdf").exists()
+    message = next(event for event in events if event["type"] == "assistant_message")
+    assert "ran out of steps" in message["content"]
+    assert "continue" in message["content"]
+
+
+@pytest.mark.asyncio
+async def test_exhausted_dashboard_turn_says_so_instead_of_faking_html(tmp_path: Path):
+    provider = EndlessExplorerProvider()
+    sandbox = FakeSandbox("exhausted-dash", tmp_path / "workspace")
+    agent = Agent(sandbox, provider, "exhausted-dash", tmp_path / "sessions")
+
+    try:
+        events = [event async for event in agent.turn("Build a dashboard")]
+    finally:
+        await sandbox.close()
+
+    assert not any(event["type"] == "artifact" for event in events)
+    assert not (sandbox.root / "data_grounded_dashboard.html").exists()
     message = next(event for event in events if event["type"] == "assistant_message")
     assert "ran out of steps" in message["content"]
     assert "continue" in message["content"]
