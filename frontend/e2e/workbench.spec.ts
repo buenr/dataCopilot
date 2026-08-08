@@ -1,4 +1,7 @@
+import { writeFile } from 'node:fs/promises';
 import { readFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 
 import { expect, test, type Page } from '@playwright/test';
 import {
@@ -83,6 +86,12 @@ test('a user can export a spreadsheet of the findings and download it', async ({
   await expect(downloadButton).toBeVisible();
   const [download] = await Promise.all([page.waitForEvent('download'), downloadButton.click()]);
   expect(download.suggestedFilename()).toBe('summary.xlsx');
+
+  // The uploaded dataset is an input, not a deliverable: it never appears in
+  // the artifact selector even though csv files are a scannable artifact type.
+  await expect(
+    page.getByRole('option', { name: 'WA_Fn-UseC_-HR-Employee-Attrition.csv' }),
+  ).toHaveCount(0);
 });
 
 test('a user can export the chat transcript as Markdown', async ({ page }) => {
@@ -99,6 +108,32 @@ test('a user can export the chat transcript as Markdown', async ({ page }) => {
   expect(transcript).toContain('## You');
   expect(transcript).toContain('Export the attrition summary to Excel.');
   expect(transcript).toContain('## Copilot');
+});
+
+test('a sparse spreadsheet uploads cleanly and survives a refresh', async ({ page }) => {
+  // Regression: empty cells in a sparse sheet used to profile as bare NaN
+  // tokens, which are not valid JSON. The upload response silently failed to
+  // parse (the dataset panel stayed empty) and every session_ready frame
+  // raised "Received an unreadable event from the gateway" in the chat.
+  const sparse = path.join(tmpdir(), `sparse-survey-${Date.now()}.csv`);
+  await writeFile(sparse, 'name,rating,notes\nAlpha,5,\nBeta,,needs work\n,3,\n');
+
+  await openWorkbench(page);
+  await page.locator('#dataset-upload').setInputFiles(sparse);
+  // The upload response parses and the dataset card appears with its columns.
+  const card = page.locator('.dataset-card', { hasText: path.basename(sparse) });
+  await expect(card).toBeVisible();
+  await expect(card).toContainText('rating');
+  await expect(page.getByText('unreadable event')).toHaveCount(0);
+
+  // A refresh reconnects and replays session_ready; it must parse too.
+  await page.reload();
+  await expect(page.getByText('Session active')).toBeVisible();
+  await expect(page.locator('.dataset-card', { hasText: path.basename(sparse) })).toBeVisible();
+  await expect(page.getByText('unreadable event')).toHaveCount(0);
+
+  // Uploaded datasets are inputs, not deliverables: never a canvas artifact.
+  await expect(page.getByRole('option', { name: new RegExp(path.basename(sparse)) })).toHaveCount(0);
 });
 
 test('a browser refresh restores the chat and canvas artifacts', async ({ page }) => {

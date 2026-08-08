@@ -5,7 +5,7 @@ from pathlib import Path
 import httpx
 import pytest
 from app.config import Settings
-from app.main import cors_origins, create_app
+from app.main import SANDBOX_DATASET_PROFILE, _frame_json, cors_origins, create_app
 from app.sandbox import FakeSandbox, SessionManager
 
 
@@ -39,6 +39,77 @@ async def test_upload_profiles_and_preloads_dataframe(tmp_path: Path):
     execution = await session.sandbox.exec("print(df_1['revenue'].mean())")
     assert execution.stderr == ""
     assert execution.stdout.strip() == "1075.0"
+
+
+@pytest.mark.asyncio
+async def test_upload_normalizes_nan_cells_to_null(tmp_path: Path):
+    # Sparse sheets (survey exports) carry NaN cells into the profile's sample
+    # rows; bare NaN tokens would make every session frame unparseable in the
+    # browser, so the profile must contain plain nulls instead.
+    settings = Settings(sessions_dir=str(tmp_path / "sessions"))
+    manager = SessionManager(
+        settings,
+        sandbox_factory=lambda sid: FakeSandbox(sid, tmp_path / "workspaces" / sid),
+    )
+    application = create_app(settings, manager)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application),
+        base_url="http://test",
+    ) as client:
+        created = await client.post("/api/sessions")
+        session_id = created.json()["id"]
+        response = await client.post(
+            f"/api/sessions/{session_id}/files",
+            files={"files": ("survey.csv", b"rating,notes\n5,\n,great\n", "text/csv")},
+        )
+
+    assert response.status_code == 200
+    schema = response.json()["schemas"][0]
+    json.dumps(schema, allow_nan=False)
+    assert schema["sample_rows"][0]["notes"] is None
+    assert schema["sample_rows"][1]["rating"] is None
+
+
+@pytest.mark.asyncio
+async def test_kernel_dataset_profile_is_strict_json(tmp_path: Path):
+    # Docker sessions profile inside the sandbox kernel; run the production
+    # snippet verbatim and reject any non-standard JSON constants the way a
+    # browser would.
+    sandbox = FakeSandbox(root=tmp_path)
+    await sandbox.upload("data/survey.csv", b"rating,notes\n5,\n,great\n")
+    result = await sandbox.exec(SANDBOX_DATASET_PROFILE)
+    assert result.stderr == ""
+    payload = result.stdout.strip().splitlines()[-1]
+    json.loads(payload, parse_constant=lambda constant: pytest.fail(f"non-standard JSON: {constant}"))
+    profiles = json.loads(payload)
+    assert profiles[0]["sample_rows"][0]["notes"] is None
+
+
+@pytest.mark.asyncio
+async def test_scan_excludes_uploaded_datasets(tmp_path: Path):
+    # Uploads live in data/ and are inputs, not deliverables: they must not
+    # surface as canvas artifacts now that csv/xlsx are scannable types.
+    sandbox = FakeSandbox(root=tmp_path)
+    await sandbox.upload("data/survey.csv", b"a,b\n1,2\n")
+    await sandbox.upload("summary.xlsx", b"PK")
+    assert {artifact["path"] for artifact in await sandbox.artifacts()} == {"summary.xlsx"}
+
+
+def test_frame_json_never_emits_non_finite_tokens():
+    payload = _frame_json(
+        {
+            "type": "session_ready",
+            "datasets": [{"sample_rows": [{"a": float("nan"), "b": float("inf"), "c": 1.5}]}],
+        }
+    )
+    json.loads(payload, parse_constant=lambda constant: pytest.fail(f"non-standard JSON: {constant}"))
+    assert json.loads(payload)["datasets"][0]["sample_rows"][0] == {"a": None, "b": None, "c": 1.5}
+
+
+def test_frame_json_stringifies_odd_types():
+    payload = _frame_json({"type": "artifact", "path": Path("report.pdf")})
+    assert json.loads(payload)["path"] == "report.pdf"
 
 
 @pytest.mark.asyncio
