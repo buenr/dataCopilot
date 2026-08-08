@@ -331,6 +331,8 @@ def test_session_resume_restores_registered_artifact_metadata(tmp_path: Path):
         (workspace / "dashboard.html").write_text("<!doctype html>")
         (workspace / "report.pdf").write_bytes(b"%PDF-1.4 fake")
         (workspace / "chart.png").write_bytes(b"\x89PNG fake")
+        (workspace / "summary.xlsx").write_bytes(b"PK fake")
+        (workspace / "cleaned.csv").write_text("a,b\n1,2\n")
         (workspace / "recovered.html").write_text("<!doctype html>")
         # The sandbox scan reports name/path/size only; the trajectory remembers
         # the type and port the model declared for each artifact.
@@ -400,6 +402,9 @@ def test_session_resume_restores_registered_artifact_metadata(tmp_path: Path):
             assert artifacts["recovered.html"]["port"] == 8502
             # An unregistered scan hit still lands on a sensible tab.
             assert artifacts["chart.png"]["type"] == "image"
+            # Spreadsheets and CSVs infer the data download tab.
+            assert artifacts["summary.xlsx"]["type"] == "data"
+            assert artifacts["cleaned.csv"]["type"] == "data"
             # Registered artifacts replay last so the canvas re-selects the
             # artifact the user was looking at.
             assert ready["artifacts"][-1]["name"] == "recovered.html"

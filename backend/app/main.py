@@ -222,7 +222,16 @@ def _restored_artifacts(
                 remember(event.get("artifact"))
     except OSError:
         pass
-    inferred = {".pdf": "pdf", ".png": "image", ".jpg": "image", ".jpeg": "image", ".svg": "image"}
+    inferred = {
+        ".pdf": "pdf",
+        ".png": "image",
+        ".jpg": "image",
+        ".jpeg": "image",
+        ".svg": "image",
+        ".xlsx": "data",
+        ".xls": "data",
+        ".csv": "data",
+    }
     restored: list[dict[str, Any]] = []
     for item in scanned:
         name = str(item.get("name") or "")

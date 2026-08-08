@@ -134,7 +134,7 @@ class FakeSandbox:
         return [
             {"name": path.name, "path": str(path.relative_to(self.root)), "size": path.stat().st_size}
             for path in self.root.rglob("*")
-            if path.is_file() and path.suffix.lower() in {".pdf", ".html", ".png", ".jpg", ".jpeg", ".svg"}
+            if path.is_file() and path.suffix.lower() in {".pdf", ".html", ".png", ".jpg", ".jpeg", ".svg", ".xlsx", ".xls", ".csv"}
         ]
 
     async def vars(self) -> list[dict[str, Any]]:

@@ -14,6 +14,7 @@ import {
   Download,
   ExternalLink,
   FileBarChart,
+  FileDown,
   FileJson,
   FileSpreadsheet,
   FileText,
@@ -52,7 +53,7 @@ import {
   uploadDataset,
   websocketUrl,
 } from './lib/api';
-import { useWorkbench } from './store/workbench';
+import { tabForArtifact, useWorkbench } from './store/workbench';
 import type { WorkbenchState } from './store/workbench';
 import type { Artifact, ChatMessage, Dataset, DatasetColumn, SessionEvent } from './types';
 
@@ -1109,6 +1110,22 @@ function Chat({
     el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
     el.style.overflowY = el.scrollHeight > 160 ? 'auto' : 'hidden';
   }, [draft]);
+  const exportTranscript = () => {
+    // Plain-Markdown download of the conversation so far; no server round-trip.
+    const lines = ['# Data Copilot chat transcript', ''];
+    for (const message of messages) {
+      if (message.role === 'system' || message.streaming || !message.content.trim()) continue;
+      const who = message.role === 'user' ? 'You' : 'Copilot';
+      const when = new Date(message.timestamp).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+      lines.push(`## ${who} · ${when}`, '', message.content.trim(), '');
+    }
+    const blob = new Blob([lines.join('\n')], { type: 'text/markdown;charset=utf-8' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = `data-copilot-chat-${new Date().toISOString().slice(0, 10)}.md`;
+    link.click();
+    URL.revokeObjectURL(link.href);
+  };
   return (
     <section className="chat-workbench">
       <div className="column-header">
@@ -1116,14 +1133,25 @@ function Chat({
           <span className="eyebrow">Copilot</span>
           <h1>What will we uncover?</h1>
         </div>
-        <button
-          className="icon-button panel-minimize"
-          onClick={onMinimize}
-          aria-label="Minimize chat panel"
-          title="Minimize chat"
-        >
-          <PanelLeftClose size={15} />
-        </button>
+        <div className="column-actions">
+          <button
+            className="icon-button"
+            onClick={exportTranscript}
+            disabled={messages.length === 0}
+            aria-label="Export chat transcript"
+            title="Export chat transcript"
+          >
+            <FileDown size={15} />
+          </button>
+          <button
+            className="icon-button panel-minimize"
+            onClick={onMinimize}
+            aria-label="Minimize chat panel"
+            title="Minimize chat"
+          >
+            <PanelLeftClose size={15} />
+          </button>
+        </div>
       </div>
       <div className="chat-scroll">
         {messages.length === 0 && !thinking ? (
@@ -1438,6 +1466,9 @@ function Canvas({
           <button className={tab === 'image' ? 'active' : ''} onClick={() => onTab('image')}>
             <Image size={14} /> Chart
           </button>
+          <button className={tab === 'data' ? 'active' : ''} onClick={() => onTab('data')}>
+            <FileSpreadsheet size={14} /> Data
+          </button>
           <button className={tab === 'empty' ? 'active' : ''} onClick={() => onTab('empty')}>
             <PanelRight size={14} /> Overview
           </button>
@@ -1496,8 +1527,34 @@ function Canvas({
           <div className="image-preview" style={{ transform: `scale(${zoom / 100})`, transformOrigin: 'top center' }}>
             <img key={refreshKey} src={fileUrl} alt={artifact?.title || artifact?.name || 'Generated chart'} />
           </div>
+        ) : tab === 'data' && artifact ? (
+          <div className="data-preview">
+            <div className="data-card">
+              <div className="data-card-icon">
+                <FileSpreadsheet size={26} />
+              </div>
+              <h2>{artifact.title || artifact.name || 'Data export'}</h2>
+              <p>
+                {artifact.size ? `${(artifact.size / 1024).toFixed(1)} KB · ` : ''}
+                Ready to open in Excel, Numbers, or any spreadsheet app.
+              </p>
+              <button
+                className="data-download"
+                disabled={!fileUrl}
+                onClick={() => {
+                  if (!fileUrl) return;
+                  const link = document.createElement('a');
+                  link.href = fileUrl;
+                  link.download = artifact.name || 'data-copilot-export';
+                  link.click();
+                }}
+              >
+                <Download size={14} /> Download {artifact.name || 'file'}
+              </button>
+            </div>
+          </div>
         ) : (
-          <CanvasPlaceholder tab={tab} hasArtifact={Boolean(artifact)} onWeb={() => onTab(artifact?.type === 'pdf' ? 'document' : 'web')} />
+          <CanvasPlaceholder tab={tab} hasArtifact={Boolean(artifact)} onWeb={() => onTab(artifact ? tabForArtifact(artifact) : 'web')} />
         )}
       </div>
       <div className="canvas-footer">
@@ -1512,7 +1569,9 @@ function Canvas({
                   ? 'Document artifact'
                   : artifact.type === 'image'
                     ? 'Chart artifact'
-                    : 'Interactive preview'}
+                    : artifact.type === 'data'
+                      ? 'Data export'
+                      : 'Interactive preview'}
               </span>
               <button
                 disabled={!openUrl}
@@ -1549,7 +1608,15 @@ function CanvasPlaceholder({ tab, hasArtifact, onWeb }: { tab: string; hasArtifa
     <div className="canvas-placeholder">
       <div className="placeholder-grid" />
       <div className="placeholder-icon">
-        {tab === 'document' ? <FileText size={24} /> : tab === 'image' ? <Image size={24} /> : <Globe2 size={24} />}
+        {tab === 'document' ? (
+          <FileText size={24} />
+        ) : tab === 'image' ? (
+          <Image size={24} />
+        ) : tab === 'data' ? (
+          <FileSpreadsheet size={24} />
+        ) : (
+          <Globe2 size={24} />
+        )}
       </div>
       <h2>{hasArtifact ? 'Choose an artifact view' : 'Your canvas is ready'}</h2>
       <p>

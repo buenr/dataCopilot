@@ -56,9 +56,10 @@ export type WorkbenchState = {
 
 const artifactKey = (artifact: Artifact) => artifact.name ?? artifact.path ?? artifact.url ?? '';
 
-const tabForArtifact = (artifact: Artifact): CanvasTab => {
+export const tabForArtifact = (artifact: Artifact): CanvasTab => {
   if (artifact.type === 'pdf' || artifact.type === 'document') return 'document';
   if (artifact.type === 'image') return 'image';
+  if (artifact.type === 'data') return 'data';
   return 'web';
 };
 

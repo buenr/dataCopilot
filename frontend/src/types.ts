@@ -1,5 +1,5 @@
 export type ConnectionState = 'connecting' | 'connected' | 'offline' | 'error';
-export type CanvasTab = 'web' | 'document' | 'image' | 'empty';
+export type CanvasTab = 'web' | 'document' | 'image' | 'data' | 'empty';
 
 export type DatasetColumn = {
   name: string;
@@ -44,12 +44,13 @@ export type ExecutionState = {
 };
 
 export type Artifact = {
-  type?: 'webapp' | 'pdf' | 'document' | 'image';
+  type?: 'webapp' | 'pdf' | 'document' | 'image' | 'data';
   name?: string;
   url?: string;
   port?: number;
   path?: string;
   title?: string;
+  size?: number;
 };
 
 export type SessionEvent = {

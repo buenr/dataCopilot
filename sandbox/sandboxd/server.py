@@ -342,7 +342,7 @@ async def process(request: ProcessRequest) -> dict[str, Any]:
 
 @app.get("/artifacts")
 async def artifacts() -> dict[str, Any]:
-    extensions = {".pdf", ".html", ".png", ".jpg", ".jpeg", ".svg"}
+    extensions = {".pdf", ".html", ".png", ".jpg", ".jpeg", ".svg", ".xlsx", ".xls", ".csv"}
     return {
         "artifacts": [
             {"name": path.name, "path": str(path.relative_to(WORKSPACE)), "size": path.stat().st_size}
