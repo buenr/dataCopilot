@@ -2,9 +2,9 @@
 
 A container-native analytics copilot built from [`PRD.txt`](PRD.txt). Data
 Copilot lets a user upload datasets, converse with an agent that writes and
-executes Python against them, and receive interactive dashboards and PDF
-reports as downloadable artifacts, all inside isolated per-session Docker
-sandboxes.
+executes Python against them, and receive interactive dashboards, PDF
+reports, and Excel/CSV exports as downloadable artifacts, all inside isolated
+per-session Docker sandboxes. The chat itself can be exported as Markdown.
 
 ![Data Copilot workbench: the dataset explorer and analysis chat beside the
 interactive attrition dashboard the agent generated](docs/images/example-dashboard.png)
@@ -18,9 +18,10 @@ interactive attrition dashboard the agent generated](docs/images/example-dashboa
   manager (`sandboxd`).
 - **Pluggable agent backends**: a deterministic offline `mock` provider for
   development and CI, plus Anthropic and OpenAI adapters.
-- **Artifact pipeline**: dashboards (Streamlit) and PDF reports are produced
-  inside the sandbox, registered as artifacts, and served through the
-  gateway.
+- **Artifact pipeline**: dashboards, PDF reports, charts, and spreadsheet
+  (`.xlsx`/`.csv`) exports are produced inside the sandbox, registered as
+  artifacts, and served through the gateway; the chat transcript downloads as
+  Markdown straight from the workbench.
 - **Preview proxying**: HTTP and WebSocket reverse proxy into sandboxed web
   apps over ephemeral loopback ports.
 - **React workbench**: file explorer, chat, canvas tabs, and an execution
@@ -85,7 +86,7 @@ sequenceDiagram
         S-->>A: stdout, files, exit codes
         A-->>F: Stream tokens and tool events
     end
-    A->>S: register_artifact (dashboard / pdf)
+    A->>S: register_artifact (dashboard / pdf / chart / data)
     A-->>F: Artifact list + final message
     F->>G: GET /api/sessions/{id}/preview/{port}/...
     G->>S: Proxy to sandboxed web app

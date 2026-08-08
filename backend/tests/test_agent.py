@@ -7,6 +7,7 @@ import pytest
 from app.agent import (
     MAX_TURN_STEPS,
     PDF_RESCUE_CODE,
+    TOOL_DEFINITIONS,
     WRAP_UP_NUDGE,
     WRAP_UP_REMAINING_STEPS,
     Agent,
@@ -831,6 +832,30 @@ async def test_mock_chart_request_registers_image_artifact(tmp_path: Path):
     svg = (tmp_path / "workspace" / "chart.svg").read_text()
     assert svg.startswith("<svg")
     assert "revenue" in svg
+
+
+def test_register_artifact_tool_accepts_data_type():
+    schema = next(tool for tool in TOOL_DEFINITIONS if tool["function"]["name"] == "register_artifact")
+    assert "data" in schema["function"]["parameters"]["properties"]["type"]["enum"]
+
+
+@pytest.mark.asyncio
+async def test_mock_excel_request_registers_data_artifact(tmp_path: Path):
+    sandbox = FakeSandbox("excel", tmp_path / "workspace")
+    await sandbox.upload("data/sales.csv", b"region,revenue\nNorth,1200\nSouth,950\n")
+    await sandbox.exec("import pandas as pd\ndf_1 = pd.read_csv(WORKSPACE / 'data/sales.csv')")
+    agent = Agent(sandbox, MockProvider(), "excel", tmp_path / "sessions")
+
+    try:
+        events = [event async for event in agent.turn("Export the summary to Excel")]
+    finally:
+        await sandbox.close()
+
+    artifact = next(event for event in events if event["type"] == "artifact")
+    assert artifact["name"] == "summary.xlsx"
+    assert artifact["artifact"]["type"] == "data"
+    # An .xlsx is a zip container; the workbook must actually exist.
+    assert (tmp_path / "workspace" / "summary.xlsx").read_bytes()[:2] == b"PK"
 
 
 class _EmptyStream:

@@ -1,3 +1,5 @@
+import { readFile } from 'node:fs/promises';
+
 import { expect, test, type Page } from '@playwright/test';
 import {
   deleteSessionAfterTest,
@@ -69,6 +71,34 @@ test('canvas and chat panels survive minimize and expand cycles', async ({ page 
   await expect(page.getByRole('button', { name: 'Minimize canvas panel' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Minimize chat panel' })).toBeVisible();
   expect(pageErrors).toEqual([]);
+});
+
+test('a user can export a spreadsheet of the findings and download it', async ({ page }) => {
+  await openWorkbench(page);
+  await uploadSampleDataset(page);
+  await ask(page, 'Export the attrition summary to Excel.');
+
+  // The data artifact auto-selects onto the Data tab with a download card.
+  const downloadButton = page.getByRole('button', { name: 'Download summary.xlsx' });
+  await expect(downloadButton).toBeVisible();
+  const [download] = await Promise.all([page.waitForEvent('download'), downloadButton.click()]);
+  expect(download.suggestedFilename()).toBe('summary.xlsx');
+});
+
+test('a user can export the chat transcript as Markdown', async ({ page }) => {
+  await openWorkbench(page);
+  await uploadSampleDataset(page);
+  await ask(page, 'Export the attrition summary to Excel.');
+
+  const [download] = await Promise.all([
+    page.waitForEvent('download'),
+    page.getByRole('button', { name: 'Export chat transcript' }).click(),
+  ]);
+  expect(download.suggestedFilename()).toMatch(/^data-copilot-chat-\d{4}-\d{2}-\d{2}\.md$/);
+  const transcript = await readFile(await download.path(), 'utf-8');
+  expect(transcript).toContain('## You');
+  expect(transcript).toContain('Export the attrition summary to Excel.');
+  expect(transcript).toContain('## Copilot');
 });
 
 test('a browser refresh restores the chat and canvas artifacts', async ({ page }) => {

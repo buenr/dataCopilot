@@ -162,13 +162,14 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "register_artifact",
-            "description": "Register a generated HTML, PDF, image, or other artifact for the canvas. "
-            "For a webapp, register the served HTML file (for example dashboard.html or site/index.html).",
+            "description": "Register a generated HTML, PDF, image, spreadsheet, or other artifact for the canvas. "
+            "For a webapp, register the served HTML file (for example dashboard.html or site/index.html). "
+            "For an Excel or CSV export, register the file with type data so the canvas offers it for download.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "name": {"type": "string"},
-                    "type": {"type": "string", "enum": ["webapp", "pdf", "document", "image"]},
+                    "type": {"type": "string", "enum": ["webapp", "pdf", "document", "image", "data"]},
                     "port": {"type": "integer"},
                 },
                 "required": ["name"],
@@ -230,6 +231,15 @@ For chart or visualization requests, compute the chart from the uploaded data
 and save it as a PNG or SVG inside the workspace (for example,
 Path(WORKSPACE) / "chart.png"), then call register_artifact with the filename
 and type "image" so it renders on the canvas.
+
+For spreadsheet or data-export requests, compute the result from the uploaded
+data and save it inside the workspace as Excel (for example,
+Path(WORKSPACE) / "summary.xlsx" with DataFrame.to_excel; openpyxl is
+preinstalled) or CSV (with DataFrame.to_csv), then call register_artifact
+with the filename and type "data" so the canvas offers the file for download.
+Prefer Excel for polished multi-column deliverables and CSV when the user
+asks for raw data. As with every artifact, only files inside the workspace
+can be downloaded, and the task is not complete until the file is registered.
 """
     if not dataset_profiles:
         return prompt + "\nNo dataset has been uploaded yet."
@@ -325,10 +335,27 @@ class MockProvider:
         elif any(term in prompt for term in ("chart", "graph", "plot", "visuali")):
             yield {"tool": "run_python", "arguments": {"code": chart_code()}}
             yield {"tool": "register_artifact", "arguments": {"name": "chart.svg", "type": "image"}}
+        elif any(
+            term in prompt
+            for term in ("excel", "xlsx", "spreadsheet", "to csv", "as csv", "csv export", "export csv")
+        ):
+            yield {"tool": "run_python", "arguments": {"code": excel_code()}}
+            yield {"tool": "register_artifact", "arguments": {"name": "summary.xlsx", "type": "data"}}
         elif any(term in prompt for term in ("executive summary", "summary", "insight", "analy", "explore")):
             yield mock_executive_summary(messages)
         else:
             yield "I can analyze the uploaded data, build a dashboard, or write a PDF report."
+
+
+def excel_code() -> str:
+    # Mirrors a competent model: derive a real summary from df_1 and register
+    # the workbook as a downloadable data artifact.
+    return """from pathlib import Path
+import pandas as pd
+frame = globals().get("df_1")
+summary = frame.describe() if frame is not None else pd.DataFrame({"note": ["no dataset loaded"]})
+summary.to_excel(Path(WORKSPACE) / "summary.xlsx")
+"""
 
 
 def dashboard_code() -> str:
