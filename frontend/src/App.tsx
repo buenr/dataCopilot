@@ -498,17 +498,28 @@ export default function App() {
         }
       };
       socket.onmessage = (message) => {
-        if (!disposed && socketRef.current === socket) {
-          try {
-            handleEvent(JSON.parse(message.data) as SessionEvent);
-          } catch {
-            addMessage({
-              id: newId('error'),
-              role: 'system',
-              content: 'Received an unreadable event from the gateway.',
-              timestamp: Date.now(),
-            });
-          }
+        if (disposed || socketRef.current !== socket) return;
+        let event: SessionEvent;
+        try {
+          event = JSON.parse(message.data) as SessionEvent;
+        } catch {
+          // Keep the raw frame in the console so a malformed payload (e.g. bare
+          // NaN tokens) stays diagnosable instead of vanishing behind the toast.
+          console.error('Unreadable gateway frame:', String(message.data).slice(0, 500));
+          addMessage({
+            id: newId('error'),
+            role: 'system',
+            content: 'Received an unreadable event from the gateway.',
+            timestamp: Date.now(),
+          });
+          return;
+        }
+        try {
+          handleEvent(event);
+        } catch (error) {
+          // A handler bug must not masquerade as a malformed frame; log and keep
+          // listening instead of scaring the user with a wrong message.
+          console.error('Could not handle gateway event:', event, error);
         }
       };
       socket.onerror = () => {

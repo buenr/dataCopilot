@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import mimetypes
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
@@ -73,7 +74,10 @@ SANDBOX_DATASET_PROFILE = (
     + _DATASET_READER
     + "    numeric = frame.select_dtypes(include='number')\n"
     "    out.append({'name': f'df_{i}', 'file': path.name, 'rows': int(frame.shape[0]), 'columns': int(frame.shape[1]), 'dtypes': {str(k): str(v) for k, v in frame.dtypes.items()}, 'null_percentages': {str(k): float(frame[k].isna().mean()*100) for k in frame.columns}, 'numeric_stats': {str(k): {'min': float(v.min()) if not v.dropna().empty else None, 'max': float(v.max()) if not v.dropna().empty else None, 'mean': float(v.mean()) if not v.dropna().empty else None, 'median': float(v.median()) if not v.dropna().empty else None} for k, v in numeric.items()}, 'sample_rows': frame.head(5).to_dict(orient='records')})\n"
-    "print(json.dumps(out, default=str))\n"
+    # Sparse sheets yield NaN cells; bare NaN/Infinity tokens are not valid\n"
+    "# JSON and browsers refuse to parse any frame containing them.\n"
+    "out = json.loads(json.dumps(out, default=str), parse_constant=lambda _c: None)\n"
+    "print(json.dumps(out))\n"
 )
 
 
@@ -110,6 +114,35 @@ def safe_dataset_name(name: str) -> str:
     if not cleaned or cleaned in {".", ".."}:
         raise HTTPException(400, "invalid filename")
     return cleaned
+
+
+def _without_non_finite(value: Any) -> Any:
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {key: _without_non_finite(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_without_non_finite(item) for item in value]
+    return value
+
+
+def _frame_json(event: dict[str, Any]) -> str:
+    """Serialize a session frame as strict JSON.
+
+    Starlette's ``send_json`` allows bare NaN/Infinity tokens, which browsers
+    reject outright: ``JSON.parse`` throws and the client reports the frame as
+    unreadable. Dump strictly; on non-finite floats or odd types, sanitize
+    and retry instead of poisoning the stream.
+    """
+    try:
+        return json.dumps(event, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError):
+        return json.dumps(
+            _without_non_finite(event),
+            ensure_ascii=False,
+            allow_nan=False,
+            default=str,
+        )
 
 
 def _now_ms() -> int:
@@ -464,17 +497,19 @@ def create_app(settings: Settings | None = None, manager: SessionManager | None 
             # Best-effort: a sandbox hiccup must not break the reconnect handshake.
             artifacts = []
         artifacts = _restored_artifacts(Path(settings.sessions_dir), session_id, artifacts)
-        await websocket.send_json(
-            {
-                "type": "session_ready",
-                "session_id": session_id,
-                # A reload or a dropped socket reconnects to the same container, so
-                # replay what the browser cannot rebuild on its own.
-                "messages": session.transcript,
-                "datasets": session.dataset_profiles,
-                # Registered artifacts too, or a refresh would empty the canvas.
-                "artifacts": artifacts,
-            }
+        await websocket.send_text(
+            _frame_json(
+                {
+                    "type": "session_ready",
+                    "session_id": session_id,
+                    # A reload or a dropped socket reconnects to the same container, so
+                    # replay what the browser cannot rebuild on its own.
+                    "messages": session.transcript,
+                    "datasets": session.dataset_profiles,
+                    # Registered artifacts too, or a refresh would empty the canvas.
+                    "artifacts": artifacts,
+                }
+            )
         )
         agent = Agent(
             session.sandbox,
@@ -489,7 +524,7 @@ def create_app(settings: Settings | None = None, manager: SessionManager | None 
         async def send(event: dict[str, Any]) -> None:
             # The turn task and the receive loop both write to this socket.
             async with send_lock:
-                await websocket.send_json(event)
+                await websocket.send_text(_frame_json(event))
 
         async def run_turn(content: str) -> None:
             async for event in agent.turn(content):

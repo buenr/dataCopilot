@@ -134,7 +134,10 @@ class FakeSandbox:
         return [
             {"name": path.name, "path": str(path.relative_to(self.root)), "size": path.stat().st_size}
             for path in self.root.rglob("*")
-            if path.is_file() and path.suffix.lower() in {".pdf", ".html", ".png", ".jpg", ".jpeg", ".svg", ".xlsx", ".xls", ".csv"}
+            # Uploaded datasets live in data/ and are inputs, not deliverables.
+            if path.is_file()
+            and path.suffix.lower() in {".pdf", ".html", ".png", ".jpg", ".jpeg", ".svg", ".xlsx", ".xls", ".csv"}
+            and path.relative_to(self.root).parts[0] != "data"
         ]
 
     async def vars(self) -> list[dict[str, Any]]:

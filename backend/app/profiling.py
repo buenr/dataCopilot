@@ -13,10 +13,16 @@ from .paths import safe_path
 SUPPORTED_SUFFIXES = {".csv", ".xlsx", ".xls", ".parquet", ".json"}
 
 
-def _json_records(frame: pd.DataFrame, count: int = 5) -> list[dict[str, Any]]:
-    records = frame.head(count).to_dict(orient="records")
-    # pandas/numpy scalar values are not always JSON serializable.
-    return json.loads(json.dumps(records, default=str))
+def _strict_json(value: Any) -> Any:
+    """Round-trip that yields strictly valid JSON.
+
+    ``json.dumps`` happily emits bare ``NaN``/``Infinity`` tokens for non-finite
+    floats, which browsers reject outright (``JSON.parse`` throws). Sparse
+    survey-style sheets produce plenty of NaN cells, so every profile is
+    normalized here: non-finite floats become ``None`` and non-serializable
+    pandas/numpy scalars are stringified.
+    """
+    return json.loads(json.dumps(value, default=str), parse_constant=lambda _constant: None)
 
 
 def profile_dataframe(frame: pd.DataFrame) -> dict[str, Any]:
@@ -30,16 +36,18 @@ def profile_dataframe(frame: pd.DataFrame) -> dict[str, Any]:
             "mean": float(values.mean()) if not values.empty else None,
             "median": float(values.median()) if not values.empty else None,
         }
-    return {
-        "rows": int(frame.shape[0]),
-        "columns": int(frame.shape[1]),
-        "dtypes": {str(name): str(dtype) for name, dtype in frame.dtypes.items()},
-        "null_percentages": {
-            str(name): float(frame[name].isna().mean() * 100) for name in frame.columns
-        },
-        "numeric_stats": numeric_stats,
-        "sample_rows": _json_records(frame),
-    }
+    return _strict_json(
+        {
+            "rows": int(frame.shape[0]),
+            "columns": int(frame.shape[1]),
+            "dtypes": {str(name): str(dtype) for name, dtype in frame.dtypes.items()},
+            "null_percentages": {
+                str(name): float(frame[name].isna().mean() * 100) for name in frame.columns
+            },
+            "numeric_stats": numeric_stats,
+            "sample_rows": frame.head(5).to_dict(orient="records"),
+        }
+    )
 
 
 def load_dataframe(path: str | Path) -> pd.DataFrame:
