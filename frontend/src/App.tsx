@@ -24,6 +24,7 @@ import {
   HardDriveUpload,
   Image,
   LayoutPanelLeft,
+  Mail,
   Maximize2,
   Minimize2,
   PanelLeftClose,
@@ -1476,6 +1477,24 @@ function Canvas({
 }) {
   const [zoom, setZoom] = useState(100);
   const [refreshKey, setRefreshKey] = useState(0);
+  const [emailStatus, setEmailStatus] = useState<{ configured: boolean; recipient: string }>({
+    configured: false,
+    recipient: '',
+  });
+  const [emailOpen, setEmailOpen] = useState(false);
+  const [emailSubject, setEmailSubject] = useState('');
+  const [emailMessage, setEmailMessage] = useState('');
+  const [emailSending, setEmailSending] = useState(false);
+  const [emailFeedback, setEmailFeedback] = useState<{ ok: boolean; text: string } | null>(null);
+  useEffect(() => {
+    // Email is optional gateway config; the button stays disabled without it.
+    fetch(apiUrl('/api/config/email'))
+      .then((response) => (response.ok ? response.json() : null))
+      .then((data) => {
+        if (data) setEmailStatus({ configured: data.configured, recipient: data.recipient });
+      })
+      .catch(() => {});
+  }, []);
   const previewUrl = useMemo(() => {
     if (!sessionId || !artifact?.port) return '';
     const artifactName = artifact.name || '';
@@ -1492,6 +1511,39 @@ function Canvas({
       : '');
   // A web app without a downloadable file still has something worth opening.
   const openUrl = fileUrl || previewUrl;
+  const openEmailDialog = () => {
+    if (!artifact) return;
+    setEmailSubject(`Data Copilot: ${artifact.name || 'artifact'}`);
+    setEmailMessage('');
+    setEmailFeedback(null);
+    setEmailOpen(true);
+  };
+  const sendEmail = async () => {
+    if (!sessionId || !artifact?.path || emailSending) return;
+    setEmailSending(true);
+    setEmailFeedback(null);
+    try {
+      const response = await fetch(
+        apiUrl(`/api/sessions/${sessionId}/artifacts/${encodeURIComponent(artifact.path)}/email`),
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ subject: emailSubject, message: emailMessage }),
+        },
+      );
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        setEmailFeedback({ ok: false, text: data.detail || `Send failed (${response.status})` });
+        return;
+      }
+      setEmailFeedback({ ok: true, text: `Sent to ${data.recipient}` });
+      setTimeout(() => setEmailOpen(false), 1200);
+    } catch {
+      setEmailFeedback({ ok: false, text: 'Could not reach the gateway.' });
+    } finally {
+      setEmailSending(false);
+    }
+  };
   return (
     <section className="canvas">
       <div className="canvas-topbar">
@@ -1663,12 +1715,77 @@ function Canvas({
                   <Download size={13} /> Download
                 </button>
               )}
+              {fileUrl && (
+                <button
+                  disabled={!emailStatus.configured}
+                  title={
+                    emailStatus.configured
+                      ? `Email to ${emailStatus.recipient}`
+                      : 'Email is not configured on the gateway'
+                  }
+                  onClick={openEmailDialog}
+                >
+                  <Mail size={13} /> Email
+                </button>
+              )}
             </>
           ) : (
             'Artifacts appear here after a run'
           )}
         </span>
       </div>
+      {emailOpen && artifact && (
+        <div className="email-overlay" onClick={() => !emailSending && setEmailOpen(false)}>
+          <div className="email-dialog" onClick={(event) => event.stopPropagation()}>
+            <div className="email-dialog-header">
+              <h3>
+                <Mail size={15} /> Email {artifact.name || 'artifact'}
+              </h3>
+              <button
+                className="icon-button"
+                disabled={emailSending}
+                onClick={() => setEmailOpen(false)}
+              >
+                <X size={15} />
+              </button>
+            </div>
+            <label className="email-field">
+              <span>To</span>
+              <input value={emailStatus.recipient} readOnly />
+            </label>
+            <label className="email-field">
+              <span>Subject</span>
+              <input
+                value={emailSubject}
+                maxLength={200}
+                onChange={(event) => setEmailSubject(event.target.value)}
+              />
+            </label>
+            <label className="email-field">
+              <span>Message</span>
+              <textarea
+                rows={4}
+                value={emailMessage}
+                placeholder="Optional note to include with the attachment."
+                onChange={(event) => setEmailMessage(event.target.value)}
+              />
+            </label>
+            {emailFeedback && (
+              <p className={emailFeedback.ok ? 'email-feedback ok' : 'email-feedback error'}>
+                {emailFeedback.text}
+              </p>
+            )}
+            <div className="email-dialog-actions">
+              <button disabled={emailSending} onClick={() => setEmailOpen(false)}>
+                Cancel
+              </button>
+              <button className="email-send" disabled={emailSending} onClick={sendEmail}>
+                <Mail size={13} /> {emailSending ? 'Sending…' : 'Send'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </section>
   );
 }

@@ -28,6 +28,9 @@ interactive attrition dashboard the agent generated](docs/images/example-dashboa
   analysis as a runnable Python script, stitched from the executed
   `run_python` cells with a data-loading preamble, so results can be
   reproduced outside Data Copilot.
+- **Artifact email delivery**: any file artifact can be emailed as an
+  attachment from the canvas, sent by the gateway over SMTP to a
+  pre-configured recipient.
 - **Preview proxying**: HTTP and WebSocket reverse proxy into sandboxed web
   apps over ephemeral loopback ports.
 - **React workbench**: file explorer, chat, canvas tabs, and an execution
@@ -204,6 +207,32 @@ placed in `.env`:
 | `SANDBOX_ALLOW_EGRESS` | `false` | Allow outbound network access from sandboxes |
 | `DOCKER_SOCKET` | `unix:///var/run/docker.sock` | Docker daemon socket |
 | `SESSIONS_DIR` | `sessions` | Trajectory log directory |
+| `SMTP_HOST` / `SMTP_PORT` | empty / `587` | SMTP relay for artifact email; empty host disables the feature |
+| `SMTP_STARTTLS` | `true` | Upgrade the SMTP connection with STARTTLS |
+| `SMTP_USER` / `SMTP_PASSWORD` | empty | SMTP credentials (use an app password, not your account password) |
+| `EMAIL_FROM` | empty | Sender address on outgoing artifact emails |
+| `EMAIL_RECIPIENT` | empty | Fixed destination address; the only address emails can go to |
+
+### Email delivery
+
+Any file artifact (PDF report, slide deck, chart, data export) can be emailed
+as an attachment from the canvas footer. Delivery runs on the gateway over
+SMTP, so sandbox egress stays disabled and credentials never enter the
+sandbox. The recipient is fixed server-side via `EMAIL_RECIPIENT` — the UI
+shows it read-only — so the endpoint cannot be used as an open relay.
+Attachments over 20 MB are rejected.
+
+Gmail example (requires 2-Step Verification, then an [app
+password](https://myaccount.google.com/apppasswords)):
+
+```env
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=you@gmail.com
+SMTP_PASSWORD=your-16-char-app-password
+EMAIL_FROM=you@gmail.com
+EMAIL_RECIPIENT=you@gmail.com
+```
 
 ## API surface
 
@@ -214,6 +243,8 @@ placed in `.env`:
 | `GET` | `/api/sessions/{session_id}` | Session state, files, and artifacts |
 | `POST` | `/api/sessions/{session_id}/files` | Upload and profile datasets |
 | `GET` | `/api/sessions/{session_id}/artifacts/{name}` | Download a registered artifact |
+| `POST` | `/api/sessions/{session_id}/artifacts/{name}/email` | Email an artifact to the configured recipient |
+| `GET` | `/api/config/email` | Whether email is configured, and the fixed recipient |
 | `GET` | `/api/sessions/{session_id}/export/script` | Download the session's analysis as a runnable Python script |
 | `DELETE` | `/api/sessions/{session_id}` | Tear down container and volume |
 | `ANY` | `/api/sessions/{session_id}/preview/{port}/{path}` | HTTP preview proxy into the sandbox |

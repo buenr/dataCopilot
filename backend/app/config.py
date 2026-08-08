@@ -25,6 +25,19 @@ class Settings(BaseSettings):
     anthropic_model: str = "claude-sonnet-5"
     openai_model: str = "gpt-5.6"
     sessions_dir: str = "sessions"
+    # Artifact email delivery. Empty smtp_host disables the feature; the
+    # recipient is fixed server-side so the gateway is never an open relay.
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_starttls: bool = True
+    smtp_user: str = ""
+    smtp_password: str = Field(default="", repr=False)
+    email_from: str = ""
+    email_recipient: str = ""
+
+    @property
+    def email_configured(self) -> bool:
+        return bool(self.smtp_host and self.email_from and self.email_recipient)
 
 
     model_config = SettingsConfigDict(

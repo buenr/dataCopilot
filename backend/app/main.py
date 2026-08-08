@@ -6,6 +6,7 @@ import asyncio
 import json
 import math
 import mimetypes
+import smtplib
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -28,6 +29,7 @@ from pydantic import BaseModel, Field
 
 from .agent import Agent, AnthropicProvider, MockProvider, OpenAIProvider
 from .config import Settings, get_settings
+from .email import AttachmentTooLargeError, build_message, send_message
 from .export import build_analysis_script
 from .profiling import profile_files
 from .proxy import preview_target
@@ -37,6 +39,11 @@ from .sandbox import SessionManager
 class Message(BaseModel):
     type: str = "user_message"
     content: str = Field(min_length=1)
+
+
+class EmailRequest(BaseModel):
+    subject: str = Field(default="", max_length=200)
+    message: str = Field(default="", max_length=10_000)
 
 
 # Filter before numbering so df_N matches profiling.profile_files; enumerating all
@@ -380,6 +387,44 @@ def create_app(settings: Settings | None = None, manager: SessionManager | None 
             raise HTTPException(404, "artifact not found") from exc
         media_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
         return Response(content=content, media_type=media_type)
+
+    @application.get("/api/config/email")
+    async def email_config() -> dict[str, Any]:
+        return {
+            "configured": settings.email_configured,
+            "recipient": settings.email_recipient if settings.email_configured else "",
+        }
+
+    @application.post("/api/sessions/{session_id}/artifacts/{name:path}/email")
+    async def email_artifact(session_id: str, name: str, request: EmailRequest) -> dict[str, Any]:
+        if not settings.email_configured:
+            raise HTTPException(503, "email is not configured on this gateway")
+        try:
+            session = session_manager.get(session_id)
+            content = await session.sandbox.read_file(name)
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except (FileNotFoundError, ValueError, httpx.HTTPError) as exc:
+            raise HTTPException(404, "artifact not found") from exc
+        filename = PurePosixPath(name).name
+        subject = request.subject.strip() or f"Data Copilot: {filename}"
+        try:
+            message = build_message(
+                settings.email_from,
+                settings.email_recipient,
+                subject,
+                request.message,
+                filename,
+                content,
+            )
+        except AttachmentTooLargeError as exc:
+            raise HTTPException(413, str(exc)) from exc
+        try:
+            # smtplib is blocking; keep it off the event loop.
+            await asyncio.to_thread(send_message, settings, message)
+        except (smtplib.SMTPException, OSError) as exc:
+            raise HTTPException(502, f"SMTP delivery failed: {exc}") from exc
+        return {"sent": True, "recipient": settings.email_recipient, "name": filename}
 
     @application.get("/api/sessions/{session_id}/export/script")
     async def export_script(session_id: str) -> Response:

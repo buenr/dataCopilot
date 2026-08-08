@@ -316,3 +316,22 @@ h1, h2, p { margin: 0; }
   .inspector-pane { min-height: 75px; }
   .canvas-footer-right > span { display: none; }
 }
+
+.email-overlay { position: fixed; inset: 0; z-index: 20; display: flex; align-items: center; justify-content: center; background: rgba(4, 7, 11, .62); backdrop-filter: blur(2px); }
+.email-dialog { width: 400px; max-width: calc(100vw - 40px); padding: 18px 20px; border: 1px solid var(--line-bright); border-radius: 10px; background: var(--panel-raised); box-shadow: 0 18px 44px rgba(0,0,0,.5); }
+.email-dialog-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.email-dialog-header h3 { display: flex; align-items: center; gap: 7px; margin: 0; font-size: 13px; font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.email-field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
+.email-field span { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+.email-field input, .email-field textarea { padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--text); font-size: 12px; resize: vertical; }
+.email-field input:focus, .email-field textarea:focus { outline: none; border-color: var(--blue); }
+.email-field input[readonly] { color: var(--muted); }
+.email-feedback { margin: 4px 0 0; font-size: 11px; }
+.email-feedback.ok { color: var(--mint); }
+.email-feedback.error { color: var(--danger); }
+.email-dialog-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 14px; }
+.email-dialog-actions button { display: flex; align-items: center; gap: 5px; padding: 6px 14px; border: 1px solid var(--line); border-radius: 6px; background: none; color: var(--muted); cursor: pointer; font-size: 12px; }
+.email-dialog-actions button:hover { color: var(--text); border-color: var(--line-bright); }
+.email-dialog-actions .email-send { border-color: var(--blue); color: var(--blue-bright); }
+.email-dialog-actions .email-send:hover { background: rgba(109, 157, 255, .12); }
+.email-dialog-actions button:disabled { opacity: .5; cursor: default; }
