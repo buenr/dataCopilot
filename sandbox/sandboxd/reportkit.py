@@ -28,6 +28,11 @@ Typical PDF use::
 
 HTML pages mirror the same API via ``HtmlPage(title, ...).save(path)``.
 An appendix is just more sections; the agent controls document length.
+
+PowerPoint decks follow the same philosophy via ``Deck(title, ...).build(path)``:
+``title_slide()`` and ``section()`` are self-contained, ``slide(title)`` starts a
+content slide, and the content methods (kpi_row, prose, bullets, table, callout,
+chart, figure) append to it top to bottom.
 """
 
 from __future__ import annotations
@@ -46,6 +51,11 @@ import matplotlib
 matplotlib.use("Agg")  # sandbox has no display; render charts headlessly
 
 import matplotlib.pyplot as plt
+from pptx import Presentation
+from pptx.dml.color import RGBColor
+from pptx.enum.shapes import MSO_SHAPE
+from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
+from pptx.util import Emu, Inches, Pt
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import ParagraphStyle
@@ -85,6 +95,19 @@ def _md_lite(text: str) -> str:
     escaped = _html_module.escape(text)
     escaped = _BOLD_RE.sub(r"<b>\1</b>", escaped)
     return _ITALIC_RE.sub(r"<i>\1</i>", escaped)
+
+
+def _plain(text: str) -> str:
+    """Strip markdown-lite emphasis for plain PowerPoint text runs."""
+    text = _BOLD_RE.sub(r"\1", str(text))
+    return _ITALIC_RE.sub(r"\1", text)
+
+
+def _flow_height(text: str, *, size: float, width: float) -> float:
+    """Rough rendered height (inches) for wrapped text in a slide textbox."""
+    chars = max(20, int(width * 10.5 * 14 / size))
+    lines = max(1, -(-len(text) // chars))
+    return lines * size * 1.5 / 72
 
 
 def _hex(value: str) -> colors.Color:
@@ -654,4 +677,319 @@ figcaption, .caption {{ color: {pal['muted']}; font-size: 12px; margin-top: 4px;
             f"<body><main>{''.join(self.parts)}</main></body></html>"
         )
         target.write_text(document, encoding="utf-8")
+        return str(target)
+
+
+class Deck:
+    """Compose a styled 16:9 PowerPoint deck (.pptx) from slides and charts.
+
+    Same philosophy as PdfReport: the caller decides structure, copy, and
+    theming; this class absorbs the python-pptx mechanics. ``title_slide()``
+    and ``section()`` are self-contained slides; ``slide(title)`` starts a
+    content slide that the content methods (prose, bullets, kpi_row, table,
+    callout, chart, figure) append to, flowing top to bottom.
+    """
+
+    _SLIDE_W = 13.333
+    _SLIDE_H = 7.5
+    _MARGIN = 0.6
+    _CONTENT_W = _SLIDE_W - 2 * _MARGIN
+
+    def __init__(
+        self,
+        title: str,
+        subtitle: str = "",
+        *,
+        theme: str = "light",
+        accent: str = "#2f6fed",
+        author: str = "Data Copilot",
+    ) -> None:
+        self.title = title
+        self.subtitle = subtitle
+        self.author = author
+        self.pal = _palette(theme, accent)
+        self._prs = Presentation()
+        self._prs.slide_width = Inches(self._SLIDE_W)
+        self._prs.slide_height = Inches(self._SLIDE_H)
+        self._slide: Any = None
+        self._cursor = 0.0
+
+    @staticmethod
+    def _rgb(hex_color: str) -> RGBColor:
+        return RGBColor.from_string(hex_color.lstrip("#").upper())
+
+    def _blank_slide(self) -> Any:
+        slide = self._prs.slides.add_slide(self._prs.slide_layouts[6])
+        fill = slide.background.fill
+        fill.solid()
+        fill.fore_color.rgb = self._rgb(self.pal["bg"])
+        return slide
+
+    @staticmethod
+    def _textbox(slide: Any, left: float, top: float, width: float, height: float) -> Any:
+        box = slide.shapes.add_textbox(Inches(left), Inches(top), Inches(width), Inches(height))
+        box.text_frame.word_wrap = True
+        return box.text_frame
+
+    def _para(
+        self,
+        tf: Any,
+        text: str,
+        *,
+        size: float,
+        color: str,
+        bold: bool = False,
+        align: Any = PP_ALIGN.LEFT,
+        space_after: float = 4,
+        first: bool = False,
+    ) -> None:
+        paragraph = tf.paragraphs[0] if first else tf.add_paragraph()
+        paragraph.alignment = align
+        paragraph.space_after = Pt(space_after)
+        run = paragraph.add_run()
+        run.text = _plain(text)
+        run.font.size = Pt(size)
+        run.font.bold = bold
+        run.font.color.rgb = self._rgb(color)
+
+    def _bar(self, slide: Any, left: float, top: float, width: float, height: float, color: str) -> None:
+        bar = slide.shapes.add_shape(
+            MSO_SHAPE.RECTANGLE, Inches(left), Inches(top), Inches(width), Inches(height)
+        )
+        bar.fill.solid()
+        bar.fill.fore_color.rgb = self._rgb(color)
+        bar.line.fill.background()
+        bar.shadow.inherit = False
+
+    def _current(self) -> Any:
+        if self._slide is None:
+            raise ValueError("no current slide: call .slide(title) before adding content")
+        return self._slide
+
+    def title_slide(self, *, classification: str | None = None, date: str | None = None) -> None:
+        """Add a cover slide with the deck title block."""
+        slide = self._blank_slide()
+        self._bar(slide, (self._SLIDE_W - 2.4) / 2, 2.02, 2.4, 0.045, self.pal["accent"])
+        tf = self._textbox(slide, 1.0, 2.3, self._SLIDE_W - 2.0, 1.6)
+        self._para(
+            tf, self.title, size=40, color=self.pal["ink"], bold=True,
+            align=PP_ALIGN.CENTER, first=True,
+        )
+        if self.subtitle:
+            self._para(tf, self.subtitle, size=18, color=self.pal["muted"], align=PP_ALIGN.CENTER)
+        meta = date or _today()
+        if classification:
+            meta = f"{classification} · {meta}"
+        tf = self._textbox(slide, 1.0, 5.9, self._SLIDE_W - 2.0, 0.9)
+        self._para(tf, meta, size=11, color=self.pal["muted"], align=PP_ALIGN.CENTER, first=True)
+        self._para(tf, f"Prepared by {self.author}", size=11, color=self.pal["muted"], align=PP_ALIGN.CENTER)
+        self._slide = None
+
+    def section(self, title: str) -> None:
+        """Add a section-divider slide with an accent side bar."""
+        slide = self._blank_slide()
+        self._bar(slide, 0.92, 3.02, 0.09, 1.2, self.pal["accent"])
+        tf = self._textbox(slide, 1.25, 2.95, 10.8, 1.5)
+        self._para(tf, title, size=32, color=self.pal["accent"], bold=True, first=True)
+        self._slide = None
+
+    def slide(self, title: str) -> None:
+        """Start a content slide; later content methods append to it."""
+        slide = self._blank_slide()
+        tf = self._textbox(slide, self._MARGIN, 0.32, self._CONTENT_W, 0.75)
+        self._para(tf, title, size=26, color=self.pal["ink"], bold=True, first=True)
+        self._bar(slide, self._MARGIN + 0.02, 1.08, 1.6, 0.045, self.pal["accent"])
+        self._slide = slide
+        self._cursor = 1.32
+
+    def prose(self, text: str) -> None:
+        """Add paragraphs to the current slide (**bold**/*italic* are stripped)."""
+        slide = self._current()
+        paragraphs = [p.strip() for p in text.strip().split("\n\n") if p.strip()]
+        height = sum(_flow_height(p, size=14, width=self._CONTENT_W) for p in paragraphs) + 0.2
+        tf = self._textbox(slide, self._MARGIN, self._cursor, self._CONTENT_W, height)
+        for index, paragraph in enumerate(paragraphs):
+            self._para(tf, paragraph, size=14, color=self.pal["ink"], first=index == 0, space_after=6)
+        self._cursor += height
+
+    def bullets(self, items: Sequence[Any]) -> None:
+        """Add bullet points to the current slide."""
+        slide = self._current()
+        entries = [str(item) for item in items]
+        height = (
+            sum(_flow_height(item, size=15, width=self._CONTENT_W - 0.3) for item in entries)
+            + 0.08 * len(entries)
+            + 0.15
+        )
+        tf = self._textbox(slide, self._MARGIN + 0.15, self._cursor, self._CONTENT_W - 0.15, height)
+        for index, item in enumerate(entries):
+            self._para(
+                tf, f"• {item}", size=15, color=self.pal["ink"], first=index == 0, space_after=6
+            )
+        self._cursor += height
+
+    def kpi_row(self, kpis: Sequence[Sequence[Any]]) -> None:
+        """Add a row of KPI tiles to the current slide; each entry is (label, value[, note])."""
+        slide = self._current()
+        entries = list(kpis)
+        if not entries:
+            return
+        gap = 0.2
+        width = (self._CONTENT_W - gap * (len(entries) - 1)) / len(entries)
+        for index, entry in enumerate(entries):
+            left = self._MARGIN + index * (width + gap)
+            tile = slide.shapes.add_shape(
+                MSO_SHAPE.ROUNDED_RECTANGLE,
+                Inches(left), Inches(self._cursor), Inches(width), Inches(1.15),
+            )
+            tile.fill.solid()
+            tile.fill.fore_color.rgb = self._rgb(self.pal["panel"])
+            tile.line.color.rgb = self._rgb(self.pal["rule"])
+            tile.line.width = Pt(0.75)
+            tile.shadow.inherit = False
+            tf = tile.text_frame
+            tf.word_wrap = True
+            tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+            self._para(
+                tf, _cell(entry[1]), size=22, color=self.pal["accent"], bold=True,
+                align=PP_ALIGN.CENTER, first=True, space_after=2,
+            )
+            self._para(
+                tf, str(entry[0]).upper(), size=9, color=self.pal["muted"],
+                align=PP_ALIGN.CENTER, space_after=0,
+            )
+            if len(entry) > 2:
+                self._para(
+                    tf, str(entry[2]), size=8, color=self.pal["muted"],
+                    align=PP_ALIGN.CENTER, space_after=0,
+                )
+        self._cursor += 1.15 + 0.2
+
+    def _style_cell(self, cell: Any, text: str, *, fill: str, size: float, bold: bool = False) -> None:
+        cell.fill.solid()
+        cell.fill.fore_color.rgb = self._rgb(fill)
+        cell.vertical_anchor = MSO_ANCHOR.MIDDLE
+        cell.margin_left = Inches(0.08)
+        cell.margin_right = Inches(0.08)
+        cell.margin_top = Inches(0.02)
+        cell.margin_bottom = Inches(0.02)
+        cell.text_frame.word_wrap = True
+        self._para(
+            cell.text_frame, text, size=size, color=self.pal["ink"], bold=bold,
+            first=True, space_after=0,
+        )
+
+    def table(
+        self,
+        data: Any,
+        *,
+        columns: Sequence[str] | None = None,
+        title: str | None = None,
+        max_rows: int = 10,
+    ) -> None:
+        """Add a styled table to the current slide (DataFrame / dicts / rows)."""
+        slide = self._current()
+        header, rows, hidden = _rows_from(data, columns, max_rows)
+        if not header:
+            return
+        if title:
+            tf = self._textbox(slide, self._MARGIN, self._cursor, self._CONTENT_W, 0.35)
+            self._para(tf, title, size=14, color=self.pal["ink"], bold=True, first=True)
+            self._cursor += 0.4
+        count = len(header)
+        row_height = 0.34
+        height = row_height * (len(rows) + 1)
+        frame = slide.shapes.add_table(
+            len(rows) + 1, count,
+            Inches(self._MARGIN), Inches(self._cursor), Inches(self._CONTENT_W), Inches(height),
+        )
+        table = frame.table
+        table.first_row = False
+        table.horz_banding = False
+        for column in table.columns:
+            column.width = Emu(int(Inches(self._CONTENT_W) / count))
+        for row in table.rows:
+            row.height = Emu(int(Inches(row_height)))
+        tint = _tint_css(self.pal["accent"])
+        for j, label in enumerate(header):
+            self._style_cell(table.cell(0, j), label, fill=tint, size=11, bold=True)
+        for i, row in enumerate(rows, 1):
+            fill = self.pal["bg"] if i % 2 else self.pal["panel"]
+            for j, value in enumerate(row):
+                self._style_cell(table.cell(i, j), value, fill=fill, size=10.5)
+        self._cursor += height + 0.15
+        if hidden:
+            tf = self._textbox(slide, self._MARGIN, self._cursor, self._CONTENT_W, 0.3)
+            self._para(tf, f"... {hidden} more rows not shown.", size=10, color=self.pal["muted"], first=True)
+            self._cursor += 0.32
+
+    def callout(self, title: str, text: str) -> None:
+        """Add an accent-bordered highlight box to the current slide."""
+        slide = self._current()
+        paragraphs = [p.strip() for p in text.strip().split("\n\n") if p.strip()]
+        height = (
+            0.45
+            + sum(_flow_height(p, size=12.5, width=self._CONTENT_W - 0.4) for p in paragraphs)
+            + 0.1 * len(paragraphs)
+        )
+        box = slide.shapes.add_shape(
+            MSO_SHAPE.ROUNDED_RECTANGLE,
+            Inches(self._MARGIN), Inches(self._cursor), Inches(self._CONTENT_W), Inches(height),
+        )
+        box.fill.solid()
+        box.fill.fore_color.rgb = self._rgb(self.pal["panel"])
+        box.line.color.rgb = self._rgb(self.pal["accent"])
+        box.line.width = Pt(1.5)
+        box.shadow.inherit = False
+        tf = box.text_frame
+        tf.word_wrap = True
+        tf.margin_left = Inches(0.15)
+        tf.margin_top = Inches(0.1)
+        self._para(tf, title, size=12.5, color=self.pal["accent"], bold=True, first=True, space_after=4)
+        for paragraph in paragraphs:
+            self._para(tf, paragraph, size=12.5, color=self.pal["ink"], space_after=4)
+        self._cursor += height + 0.18
+
+    def _place_image(self, slide: Any, png: bytes, width: float) -> None:
+        px_w = int.from_bytes(png[16:20], "big")
+        px_h = int.from_bytes(png[20:24], "big")
+        height = width * (px_h / px_w) if px_w else width * 0.5
+        left = (self._SLIDE_W - width) / 2
+        slide.shapes.add_picture(
+            io.BytesIO(png), Inches(left), Inches(self._cursor), width=Inches(width)
+        )
+        self._cursor += height + 0.18
+
+    def chart(
+        self,
+        x: Any,
+        y: Any = None,
+        *,
+        kind: str = "bar",
+        title: str = "",
+        xlabel: str = "",
+        ylabel: str = "",
+        width: float = 7.2,
+    ) -> None:
+        """Add a quick themed chart (bar/line/scatter/hist) to the current slide."""
+        slide = self._current()
+        png = _chart_png(x, y, kind=kind, title=title, xlabel=xlabel, ylabel=ylabel, pal=self.pal)
+        self._place_image(slide, png, width)
+
+    def figure(self, fig: Any, *, caption: str | None = None, width: float = 7.2) -> None:
+        """Embed any matplotlib figure on the current slide."""
+        slide = self._current()
+        self._place_image(slide, _fig_png(fig), width)
+        if caption:
+            tf = self._textbox(slide, self._MARGIN, self._cursor, self._CONTENT_W, 0.3)
+            self._para(
+                tf, caption, size=10, color=self.pal["muted"], align=PP_ALIGN.CENTER, first=True
+            )
+            self._cursor += 0.3
+
+    def build(self, path: Any) -> str:
+        """Save the deck to ``path`` (.pptx) and return it as a string."""
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        self._prs.save(str(target))
         return str(target)

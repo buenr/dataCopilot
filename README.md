@@ -3,8 +3,9 @@
 A container-native analytics copilot built from [`PRD.txt`](PRD.txt). Data
 Copilot lets a user upload datasets, converse with an agent that writes and
 executes Python against them, and receive interactive dashboards, PDF
-reports, and Excel/CSV exports as downloadable artifacts, all inside isolated
-per-session Docker sandboxes. The chat itself can be exported as Markdown.
+reports, PowerPoint decks, and Excel/CSV exports as downloadable artifacts,
+all inside isolated per-session Docker sandboxes. The chat itself can be
+exported as Markdown, and the session's analysis as a runnable Python script.
 
 ![Data Copilot workbench: the dataset explorer and analysis chat beside the
 interactive attrition dashboard the agent generated](docs/images/example-dashboard.png)
@@ -18,10 +19,15 @@ interactive attrition dashboard the agent generated](docs/images/example-dashboa
   manager (`sandboxd`).
 - **Pluggable agent backends**: a deterministic offline `mock` provider for
   development and CI, plus Anthropic and OpenAI adapters.
-- **Artifact pipeline**: dashboards, PDF reports, charts, and spreadsheet
-  (`.xlsx`/`.csv`) exports are produced inside the sandbox, registered as
-  artifacts, and served through the gateway; the chat transcript downloads as
-  Markdown straight from the workbench.
+- **Artifact pipeline**: dashboards, PDF reports, charts, spreadsheet
+  (`.xlsx`/`.csv`) exports, and PowerPoint slide decks (`.pptx`, built with
+  the sandboxed `reportkit.Deck` helper) are produced inside the sandbox,
+  registered as artifacts, and served through the gateway; the chat
+  transcript downloads as Markdown straight from the workbench.
+- **Analysis script export**: the workbench can download the session's
+  analysis as a runnable Python script, stitched from the executed
+  `run_python` cells with a data-loading preamble, so results can be
+  reproduced outside Data Copilot.
 - **Preview proxying**: HTTP and WebSocket reverse proxy into sandboxed web
   apps over ephemeral loopback ports.
 - **React workbench**: file explorer, chat, canvas tabs, and an execution
@@ -86,7 +92,7 @@ sequenceDiagram
         S-->>A: stdout, files, exit codes
         A-->>F: Stream tokens and tool events
     end
-    A->>S: register_artifact (dashboard / pdf / chart / data)
+    A->>S: register_artifact (dashboard / pdf / chart / data / slides)
     A-->>F: Artifact list + final message
     F->>G: GET /api/sessions/{id}/preview/{port}/...
     G->>S: Proxy to sandboxed web app
@@ -208,6 +214,7 @@ placed in `.env`:
 | `GET` | `/api/sessions/{session_id}` | Session state, files, and artifacts |
 | `POST` | `/api/sessions/{session_id}/files` | Upload and profile datasets |
 | `GET` | `/api/sessions/{session_id}/artifacts/{name}` | Download a registered artifact |
+| `GET` | `/api/sessions/{session_id}/export/script` | Download the session's analysis as a runnable Python script |
 | `DELETE` | `/api/sessions/{session_id}` | Tear down container and volume |
 | `ANY` | `/api/sessions/{session_id}/preview/{port}/{path}` | HTTP preview proxy into the sandbox |
 | `WS` | `/api/sessions/{session_id}/preview/{port}/{path}` | WebSocket preview proxy |
@@ -223,7 +230,7 @@ The agent orchestrator exposes a fixed tool set to the provider:
 | `write_file` / `read_file` | File I/O inside the sandbox workspace |
 | `list_files` | Enumerate workspace files |
 | `start_webapp` / `stop_webapp` | Manage sandboxed web apps (dashboards) on registered ports |
-| `register_artifact` | Publish a generated file (dashboard, PDF) to the client |
+| `register_artifact` | Publish a generated file (dashboard, PDF, deck, export) to the client |
 
 ## Sandbox isolation
 

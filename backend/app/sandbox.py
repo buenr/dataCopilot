@@ -136,7 +136,7 @@ class FakeSandbox:
             for path in self.root.rglob("*")
             # Uploaded datasets live in data/ and are inputs, not deliverables.
             if path.is_file()
-            and path.suffix.lower() in {".pdf", ".html", ".png", ".jpg", ".jpeg", ".svg", ".xlsx", ".xls", ".csv"}
+            and path.suffix.lower() in {".pdf", ".html", ".png", ".jpg", ".jpeg", ".svg", ".xlsx", ".xls", ".csv", ".pptx"}
             and path.relative_to(self.root).parts[0] != "data"
         ]
 

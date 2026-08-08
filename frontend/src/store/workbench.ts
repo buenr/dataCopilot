@@ -60,6 +60,7 @@ export const tabForArtifact = (artifact: Artifact): CanvasTab => {
   if (artifact.type === 'pdf' || artifact.type === 'document') return 'document';
   if (artifact.type === 'image') return 'image';
   if (artifact.type === 'data') return 'data';
+  if (artifact.type === 'slides') return 'slides';
   return 'web';
 };
 

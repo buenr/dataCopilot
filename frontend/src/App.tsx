@@ -14,6 +14,7 @@ import {
   Download,
   ExternalLink,
   FileBarChart,
+  FileCode,
   FileDown,
   FileJson,
   FileSpreadsheet,
@@ -33,6 +34,7 @@ import {
   Paperclip,
   Play,
   Plus,
+  Presentation,
   RefreshCw,
   Search,
   Sparkles,
@@ -727,6 +729,7 @@ export default function App() {
               className="chat-panel"
             >
               <Chat
+                sessionId={sessionId}
                 messages={messages}
                 tools={tools}
                 draft={draft}
@@ -1069,6 +1072,7 @@ function DatasetCard({ dataset, onDelete }: { dataset: Dataset; onDelete: (name:
 }
 
 function Chat({
+  sessionId,
   messages,
   tools,
   draft,
@@ -1088,6 +1092,7 @@ function Chat({
   onMinimize,
   datasets,
 }: {
+  sessionId?: string;
   messages: WorkbenchState['messages'];
   tools: WorkbenchState['tools'];
   draft: string;
@@ -1137,6 +1142,20 @@ function Chat({
     link.click();
     URL.revokeObjectURL(link.href);
   };
+  const exportScript = async () => {
+    // Server-side export: stitches the session's run_python cells into a
+    // runnable script with a data-loading preamble, so the analysis can be
+    // repeated outside Data Copilot.
+    if (!sessionId) return;
+    const response = await fetch(apiUrl(`/api/sessions/${sessionId}/export/script`));
+    if (!response.ok) return;
+    const blob = await response.blob();
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = `data-copilot-analysis-${sessionId.slice(0, 8)}.py`;
+    link.click();
+    URL.revokeObjectURL(link.href);
+  };
   return (
     <section className="chat-workbench">
       <div className="column-header">
@@ -1145,6 +1164,15 @@ function Chat({
           <h1>What will we uncover?</h1>
         </div>
         <div className="column-actions">
+          <button
+            className="icon-button"
+            onClick={exportScript}
+            disabled={!sessionId || messages.length === 0}
+            aria-label="Export analysis script"
+            title="Export analysis script"
+          >
+            <FileCode size={15} />
+          </button>
           <button
             className="icon-button"
             onClick={exportTranscript}
@@ -1480,6 +1508,9 @@ function Canvas({
           <button className={tab === 'data' ? 'active' : ''} onClick={() => onTab('data')}>
             <FileSpreadsheet size={14} /> Data
           </button>
+          <button className={tab === 'slides' ? 'active' : ''} onClick={() => onTab('slides')}>
+            <Presentation size={14} /> Slides
+          </button>
           <button className={tab === 'empty' ? 'active' : ''} onClick={() => onTab('empty')}>
             <PanelRight size={14} /> Overview
           </button>
@@ -1564,6 +1595,32 @@ function Canvas({
               </button>
             </div>
           </div>
+        ) : tab === 'slides' && artifact ? (
+          <div className="data-preview">
+            <div className="data-card">
+              <div className="data-card-icon">
+                <Presentation size={26} />
+              </div>
+              <h2>{artifact.title || artifact.name || 'Slide deck'}</h2>
+              <p>
+                {artifact.size ? `${(artifact.size / 1024).toFixed(1)} KB · ` : ''}
+                Ready to open in PowerPoint, Keynote, or Google Slides.
+              </p>
+              <button
+                className="data-download"
+                disabled={!fileUrl}
+                onClick={() => {
+                  if (!fileUrl) return;
+                  const link = document.createElement('a');
+                  link.href = fileUrl;
+                  link.download = artifact.name || 'data-copilot-deck.pptx';
+                  link.click();
+                }}
+              >
+                <Download size={14} /> Download {artifact.name || 'deck.pptx'}
+              </button>
+            </div>
+          </div>
         ) : (
           <CanvasPlaceholder tab={tab} hasArtifact={Boolean(artifact)} onWeb={() => onTab(artifact ? tabForArtifact(artifact) : 'web')} />
         )}
@@ -1582,7 +1639,9 @@ function Canvas({
                     ? 'Chart artifact'
                     : artifact.type === 'data'
                       ? 'Data export'
-                      : 'Interactive preview'}
+                      : artifact.type === 'slides'
+                        ? 'Slide deck'
+                        : 'Interactive preview'}
               </span>
               <button
                 disabled={!openUrl}
@@ -1625,6 +1684,8 @@ function CanvasPlaceholder({ tab, hasArtifact, onWeb }: { tab: string; hasArtifa
           <Image size={24} />
         ) : tab === 'data' ? (
           <FileSpreadsheet size={24} />
+        ) : tab === 'slides' ? (
+          <Presentation size={24} />
         ) : (
           <Globe2 size={24} />
         )}

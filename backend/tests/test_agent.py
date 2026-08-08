@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import types
@@ -15,6 +16,7 @@ from app.agent import (
     MockProvider,
     OpenAIProvider,
     ToolDispatcher,
+    _elide,
 )
 from app.sandbox import FakeSandbox
 
@@ -839,6 +841,34 @@ def test_register_artifact_tool_accepts_data_type():
     assert "data" in schema["function"]["parameters"]["properties"]["type"]["enum"]
 
 
+def test_register_artifact_tool_accepts_slides_type():
+    schema = next(tool for tool in TOOL_DEFINITIONS if tool["function"]["name"] == "register_artifact")
+    assert "slides" in schema["function"]["parameters"]["properties"]["type"]["enum"]
+
+
+@pytest.mark.asyncio
+async def test_mock_slides_request_registers_slides_artifact(tmp_path: Path):
+    sandbox = FakeSandbox("slides", tmp_path / "workspace")
+    await sandbox.upload("data/sales.csv", b"region,revenue\nNorth,1200\nSouth,950\n")
+    await sandbox.exec("import pandas as pd\ndf_1 = pd.read_csv(WORKSPACE / 'data/sales.csv')")
+    agent = Agent(sandbox, MockProvider(), "slides", tmp_path / "sessions")
+
+    try:
+        events = [event async for event in agent.turn("Build a slide deck summarizing the data")]
+    finally:
+        await sandbox.close()
+
+    artifact = next(event for event in events if event["type"] == "artifact")
+    assert artifact["name"] == "deck.pptx"
+    assert artifact["artifact"]["type"] == "slides"
+    deck_path = tmp_path / "workspace" / "deck.pptx"
+    assert deck_path.read_bytes().startswith(b"PK")
+    # The hand-rolled OOXML must be a real deck PowerPoint can open.
+    from pptx import Presentation
+
+    assert len(list(Presentation(str(deck_path)).slides)) == 2
+
+
 @pytest.mark.asyncio
 async def test_mock_excel_request_registers_data_artifact(tmp_path: Path):
     sandbox = FakeSandbox("excel", tmp_path / "workspace")
@@ -1175,3 +1205,325 @@ async def test_exhausted_dashboard_turn_says_so_instead_of_faking_html(tmp_path:
     message = next(event for event in events if event["type"] == "assistant_message")
     assert "ran out of steps" in message["content"]
     assert "continue" in message["content"]
+
+
+def test_elide_keeps_head_and_tail_with_a_marker():
+    text = "abcdef" * 2_000  # 12_000 chars
+    elided = _elide(text, 4_000)
+    assert elided.startswith(text[:2_000])
+    assert elided.endswith(text[-2_000:])
+    assert "8,000 chars elided" in elided
+    assert _elide("short", 4_000) == "short"
+
+
+class NoisyThenRecordingProvider:
+    """Round 1: noisy tool calls. Round 2: capture the request messages."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.seen: list[dict] = []
+
+    async def stream(self, messages, tools):
+        self.calls += 1
+        if self.calls == 1:
+            yield {"tool": "run_python", "arguments": {"code": "print('x' * 20000)"}}
+            yield {
+                "tool": "write_file",
+                "arguments": {
+                    "path": "big.html",
+                    "content": "<html>" + "z" * 30000 + "</html>",
+                },
+            }
+        else:
+            self.seen = [dict(message) for message in messages]
+            yield "wrapped up"
+
+
+@pytest.mark.asyncio
+async def test_history_keeps_tool_signal_without_the_bulk(tmp_path: Path):
+    provider = NoisyThenRecordingProvider()
+    sandbox = FakeSandbox("hygiene", tmp_path / "workspace")
+    agent = Agent(sandbox, provider, "hygiene", tmp_path / "sessions")
+
+    try:
+        events = [event async for event in agent.turn("Analyze the data")]
+    finally:
+        await sandbox.close()
+
+    tool_messages = [m for m in provider.seen if m.get("role") == "tool"]
+    assert len(tool_messages) == 2
+    run_python_result = json.loads(tool_messages[0]["content"])
+    # Stream events and the executed code are for the client and the
+    # trajectory; the running prompt keeps only elided stdout/stderr.
+    assert "events" not in run_python_result
+    assert "code" not in run_python_result
+    assert "chars elided" in run_python_result["stdout"]
+    assert len(run_python_result["stdout"]) < 5_000
+
+    assistant = next(
+        m for m in provider.seen if m.get("role") == "assistant" and m.get("tool_calls")
+    )
+    calls = {c["function"]["name"]: c for c in assistant["tool_calls"]}
+    # The analysis code stays in history; the 30 KB file payload does not.
+    run_args = json.loads(calls["run_python"]["function"]["arguments"])
+    assert run_args["code"] == "print('x' * 20000)"
+    write_args = json.loads(calls["write_file"]["function"]["arguments"])
+    assert write_args["path"] == "big.html"
+    assert "30,013 bytes" in write_args["content"]
+    assert "z" * 100 not in write_args["content"]
+
+    # The client stream is unaffected: the full result still reaches it.
+    tool_result = next(
+        e for e in events if e["type"] == "tool_result" and e["tool"] == "run_python"
+    )
+    assert len(tool_result["stdout"]) > 20_000
+    assert "events" in tool_result
+
+
+class SlidesWithoutHandoffProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def stream(self, messages, tools):
+        self.calls += 1
+        if self.calls == 1:
+            yield {
+                "tool": "write_file",
+                "arguments": {"path": "deck.pptx", "content": "PK\x03\x04 fake deck bytes"},
+            }
+
+
+@pytest.mark.asyncio
+async def test_slides_are_recovered_when_provider_omits_handoff(tmp_path: Path):
+    sandbox = FakeSandbox("slides-recovery", tmp_path / "workspace")
+    agent = Agent(
+        sandbox,
+        SlidesWithoutHandoffProvider(),
+        "slides-recovery",
+        tmp_path / "sessions",
+    )
+
+    try:
+        events = [event async for event in agent.turn("Build a slide deck")]
+    finally:
+        await sandbox.close()
+
+    artifact = next(event for event in events if event["type"] == "artifact")
+    assert artifact["name"] == "deck.pptx"
+    assert artifact["artifact"]["type"] == "slides"
+    assert any(
+        event["type"] == "assistant_message"
+        and "The slide deck is ready in the canvas." in event["content"]
+        for event in events
+    )
+
+
+class ChartWithoutHandoffProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def stream(self, messages, tools):
+        self.calls += 1
+        if self.calls == 1:
+            yield {
+                "tool": "write_file",
+                "arguments": {"path": "chart.png", "content": "fake png bytes"},
+            }
+
+
+@pytest.mark.asyncio
+async def test_chart_is_recovered_when_provider_omits_handoff(tmp_path: Path):
+    sandbox = FakeSandbox("chart-recovery", tmp_path / "workspace")
+    agent = Agent(
+        sandbox,
+        ChartWithoutHandoffProvider(),
+        "chart-recovery",
+        tmp_path / "sessions",
+    )
+
+    try:
+        events = [event async for event in agent.turn("Plot a chart of the top scorers")]
+    finally:
+        await sandbox.close()
+
+    artifact = next(event for event in events if event["type"] == "artifact")
+    assert artifact["name"] == "chart.png"
+    assert artifact["artifact"]["type"] == "image"
+    assert any(
+        event["type"] == "assistant_message"
+        and "The chart is ready in the canvas." in event["content"]
+        for event in events
+    )
+
+
+class DataWithoutHandoffProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def stream(self, messages, tools):
+        self.calls += 1
+        if self.calls == 1:
+            yield {
+                "tool": "write_file",
+                "arguments": {"path": "summary.xlsx", "content": "PK\x03\x04 fake workbook"},
+            }
+
+
+@pytest.mark.asyncio
+async def test_data_export_is_recovered_when_provider_omits_handoff(tmp_path: Path):
+    sandbox = FakeSandbox("data-recovery", tmp_path / "workspace")
+    agent = Agent(
+        sandbox,
+        DataWithoutHandoffProvider(),
+        "data-recovery",
+        tmp_path / "sessions",
+    )
+
+    try:
+        events = [event async for event in agent.turn("Export the summary to excel")]
+    finally:
+        await sandbox.close()
+
+    artifact = next(event for event in events if event["type"] == "artifact")
+    assert artifact["name"] == "summary.xlsx"
+    assert artifact["artifact"]["type"] == "data"
+    assert any(
+        event["type"] == "assistant_message"
+        and "The data export is ready in the canvas." in event["content"]
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_data_recovery_ignores_uploaded_datasets(tmp_path: Path):
+    """An uploaded CSV in data/ is an input; recovery must not publish it."""
+    sandbox = FakeSandbox("data-exclusion", tmp_path / "workspace")
+    await sandbox.upload("data/players.csv", b"name,pts\nA,28\n" * 10)
+    agent = Agent(
+        sandbox,
+        ReportWithoutPdfProvider(),
+        "data-exclusion",
+        tmp_path / "sessions",
+    )
+
+    try:
+        events = [event async for event in agent.turn("Export the summary to csv")]
+    finally:
+        await sandbox.close()
+
+    assert not any(event["type"] == "artifact" for event in events)
+    assert any(
+        event["type"] == "assistant_message"
+        and "could not put a file on the canvas" in event["content"]
+        for event in events
+    )
+
+
+class SlidesChartOnlyProvider:
+    """Registers only an intermediate chart image on a slide-deck prompt."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def stream(self, messages, tools):
+        self.calls += 1
+        if self.calls == 1:
+            yield {
+                "tool": "write_file",
+                "arguments": {"path": "chart.png", "content": "fake png bytes"},
+            }
+        elif self.calls == 2:
+            yield {
+                "tool": "register_artifact",
+                "arguments": {"name": "chart.png", "type": "image"},
+            }
+
+
+@pytest.mark.asyncio
+async def test_slides_turn_keeps_intermediate_chart_off_the_canvas(tmp_path: Path):
+    sandbox = FakeSandbox("slides-gate", tmp_path / "workspace")
+    agent = Agent(
+        sandbox,
+        SlidesChartOnlyProvider(),
+        "slides-gate",
+        tmp_path / "sessions",
+    )
+
+    try:
+        events = [event async for event in agent.turn("Build a slide deck")]
+    finally:
+        await sandbox.close()
+
+    assert not any(event["type"] == "artifact" for event in events)
+    assert any(
+        event["type"] == "assistant_message"
+        and "could not put a deck on the canvas" in event["content"]
+        for event in events
+    )
+
+
+class DashboardAndDeckProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def stream(self, messages, tools):
+        self.calls += 1
+        if self.calls == 1:
+            yield {
+                "tool": "write_file",
+                "arguments": {"path": "dashboard.html", "content": "<!doctype html><p>dash</p>"},
+            }
+            yield {
+                "tool": "write_file",
+                "arguments": {"path": "deck.pptx", "content": "PK\x03\x04 fake deck"},
+            }
+        elif self.calls == 2:
+            yield {
+                "tool": "start_webapp",
+                "arguments": {
+                    "command": "python -m http.server 8501 --bind 0.0.0.0",
+                    "port": 8501,
+                },
+            }
+            yield {
+                "tool": "register_artifact",
+                "arguments": {"name": "dashboard.html", "port": 8501, "type": "webapp"},
+            }
+            yield {
+                "tool": "register_artifact",
+                "arguments": {"name": "deck.pptx", "type": "slides"},
+            }
+        else:
+            yield "Both are ready."
+
+
+@pytest.mark.asyncio
+async def test_combined_dashboard_and_deck_turn_publishes_both(tmp_path: Path):
+    sandbox = FakeSandbox("combo-both", tmp_path / "workspace")
+    agent = Agent(
+        sandbox,
+        DashboardAndDeckProvider(),
+        "combo-both",
+        tmp_path / "sessions",
+    )
+
+    try:
+        events = [event async for event in agent.turn("Build a dashboard and a slide deck")]
+    finally:
+        await sandbox.close()
+
+    artifacts = [event for event in events if event["type"] == "artifact"]
+    types = {event["name"]: event["artifact"]["type"] for event in artifacts}
+    assert types == {"dashboard.html": "webapp", "deck.pptx": "slides"}
+
+
+def test_output_request_classifiers():
+    assert Agent._is_slides_request("build a slide deck")
+    assert Agent._is_slides_request("export a PowerPoint")
+    assert not Agent._is_slides_request("build a dashboard")
+    assert Agent._is_chart_request("plot the trend")
+    assert Agent._is_chart_request("make a chart")
+    assert not Agent._is_chart_request("write a report")
+    assert Agent._is_data_export_request("export the summary to excel")
+    assert Agent._is_data_export_request("save as csv")
+    assert not Agent._is_data_export_request("build a dashboard")

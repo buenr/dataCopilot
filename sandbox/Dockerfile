@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN pip install --no-cache-dir \
     pandas polars numpy scipy pyarrow openpyxl xlrd \
     streamlit dash nicegui fastapi uvicorn bottle \
-    typst weasyprint reportlab matplotlib seaborn plotly kaleido \
+    typst weasyprint reportlab python-pptx matplotlib seaborn plotly kaleido \
     ipykernel jupyter_client
 WORKDIR /app
 COPY sandboxd /app/sandboxd
