@@ -347,6 +347,9 @@ async def artifacts() -> dict[str, Any]:
         "artifacts": [
             {"name": path.name, "path": str(path.relative_to(WORKSPACE)), "size": path.stat().st_size}
             for path in WORKSPACE.rglob("*")
-            if path.is_file() and path.suffix.lower() in extensions
+            # Uploaded datasets live in data/ and are inputs, not deliverables.
+            if path.is_file()
+            and path.suffix.lower() in extensions
+            and path.relative_to(WORKSPACE).parts[0] != "data"
         ]
     }
