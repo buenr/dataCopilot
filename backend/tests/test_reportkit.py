@@ -147,3 +147,80 @@ def test_seed_reportkit_copies_kit_into_workspace(tmp_path, monkeypatch):
 
     assert target == tmp_path / "ws" / "reportkit.py"
     assert target.read_bytes() == KIT_PATH.read_bytes()
+
+
+def _slide_texts(slides):
+    return [
+        run.text
+        for slide in slides
+        for shape in slide.shapes
+        if shape.has_text_frame
+        for paragraph in shape.text_frame.paragraphs
+        for run in paragraph.runs
+    ]
+
+
+def _exercise_deck(kit, tmp_path, frame, theme):
+    deck = kit.Deck("League Audit", "2026 season", theme=theme, accent="#c0392b")
+    deck.title_slide(classification="INTERNAL")
+    deck.section("Findings")
+    deck.slide("Overview")
+    deck.kpi_row([("Teams", 4), ("Avg points", 109.1), ("Leader", "Delta", "+30.1 avg")])
+    deck.prose("Alpha is a **point-storage facility**.\n\nSecond paragraph with *italics*.")
+    deck.bullets(["First finding", "Second finding"])
+    deck.table(frame, title="Full standings", max_rows=3)
+    deck.callout("Hall of Fame", "Nobody. Everyone scored.")
+    deck.chart(frame["team"], frame["points"], kind="bar", title="Points by team", ylabel="pts")
+    fig, ax = plt.subplots(figsize=(6, 3))
+    ax.plot([1, 2, 3], [4, 3, 5])
+    deck.figure(fig, caption="Custom matplotlib figure")
+    plt.close(fig)
+    return Path(deck.build(tmp_path / f"deck-{theme}.pptx"))
+
+
+def test_deck_builds_valid_pptx(kit, tmp_path, frame):
+    from pptx import Presentation
+
+    out = _exercise_deck(kit, tmp_path, frame, "light")
+    assert out.read_bytes().startswith(b"PK")
+    prs = Presentation(str(out))
+    slides = list(prs.slides)
+    assert len(slides) == 3
+    assert prs.slide_width > prs.slide_height  # 16:9 landscape
+    texts = _slide_texts(slides)
+    assert any("League Audit" in text for text in texts)
+    assert any("First finding" in text for text in texts)
+    # Markdown-lite emphasis is stripped on slides, not rendered literally.
+    assert any(text == "Alpha is a point-storage facility." for text in texts)
+
+
+def test_deck_builds_dark_theme(kit, tmp_path, frame):
+    out = _exercise_deck(kit, tmp_path, frame, "dark")
+    assert out.read_bytes().startswith(b"PK")
+
+
+def test_deck_content_requires_current_slide(kit):
+    deck = kit.Deck("t")
+    with pytest.raises(ValueError, match="slide"):
+        deck.bullets(["no slide yet"])
+
+
+def test_deck_table_truncates_and_figure_embeds_picture(kit, tmp_path, frame):
+    from pptx import Presentation
+    from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+    deck = kit.Deck("t")
+    deck.slide("Data")
+    deck.table(frame, max_rows=2)
+    fig, ax = plt.subplots()
+    ax.bar(frame["team"], frame["points"])
+    deck.figure(fig)
+    plt.close(fig)
+    out = deck.build(tmp_path / "d.pptx")
+
+    slide = list(Presentation(str(out)).slides)[0]
+    assert any(shape.shape_type == MSO_SHAPE_TYPE.PICTURE for shape in slide.shapes)
+    table = next(shape.table for shape in slide.shapes if shape.has_table)
+    assert len(table.rows) == 3  # header plus the two kept rows
+    texts = _slide_texts([slide])
+    assert any("2 more rows not shown" in text for text in texts)

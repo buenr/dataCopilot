@@ -536,3 +536,68 @@ async def test_delete_missing_dataset_returns_404(tmp_path: Path):
         assert response.status_code == 404
 
 
+@pytest.mark.asyncio
+async def test_export_script_endpoint_replays_trajectory(tmp_path: Path):
+    settings = Settings(sessions_dir=str(tmp_path / "sessions"))
+    manager = SessionManager(
+        settings,
+        sandbox_factory=lambda sid: FakeSandbox(sid, tmp_path / "workspaces" / sid),
+    )
+    application = create_app(settings, manager)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application),
+        base_url="http://test",
+    ) as client:
+        created = await client.post("/api/sessions")
+        session_id = created.json()["id"]
+        uploaded = await client.post(
+            f"/api/sessions/{session_id}/files",
+            files={"files": ("sales.csv", b"region,revenue\nNorth,1200\nSouth,950\n", "text/csv")},
+        )
+        assert uploaded.status_code == 200
+        trajectory = tmp_path / "sessions" / session_id / "trajectory.jsonl"
+        trajectory.parent.mkdir(parents=True, exist_ok=True)
+        trajectory.write_text(
+            json.dumps(
+                {
+                    "type": "tool_result",
+                    "tool": "run_python",
+                    "result": {
+                        "code": "print(df_1['revenue'].mean())",
+                        "stdout": "1075.0",
+                        "stderr": "",
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        response = await client.get(f"/api/sessions/{session_id}/export/script")
+
+    assert response.status_code == 200
+    assert "text/x-python" in response.headers["content-type"]
+    assert f'data-copilot-analysis-{session_id[:8]}.py' in response.headers["content-disposition"]
+    assert "df_1 = pd.read_csv(DATA_DIR / 'sales.csv')" in response.text
+    assert "print(df_1['revenue'].mean())" in response.text
+    compile(response.text, "exported.py", "exec")
+
+
+@pytest.mark.asyncio
+async def test_export_script_unknown_session_returns_404(tmp_path: Path):
+    settings = Settings(sessions_dir=str(tmp_path / "sessions"))
+    manager = SessionManager(
+        settings,
+        sandbox_factory=lambda sid: FakeSandbox(sid, tmp_path / "workspaces" / sid),
+    )
+    application = create_app(settings, manager)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application),
+        base_url="http://test",
+    ) as client:
+        response = await client.get("/api/sessions/nope/export/script")
+
+    assert response.status_code == 404
+
+

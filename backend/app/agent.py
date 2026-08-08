@@ -38,13 +38,107 @@ WRAP_UP_NUDGE = (
     "summarize your findings."
 )
 
+# History hygiene: the running prompt keeps the signal from each tool result,
+# not its bulk. run_python stream events duplicate stdout chunk-by-chunk for
+# the client, and the executed code already sits in the assistant's tool_call
+# arguments, so neither is re-sent to the provider. Long outputs are elided
+# head+tail with a marker so the model knows material was dropped.
+HISTORY_OUTPUT_LIMIT = 4_000
+HISTORY_FILE_LIMIT = 8_000
+
+
+def _elide(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    half = limit // 2
+    omitted = len(text) - 2 * half
+    return f"{text[:half]}\n[... {omitted:,} chars elided ...]\n{text[-half:]}"
+
+
+def _history_arguments(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    # write_file payloads are pure bulk: once the write succeeds, the path and
+    # byte count carry all the signal the model needs for the rest of the turn.
+    if name == "write_file" and "content" in arguments:
+        size = len(str(arguments.get("content", "")).encode("utf-8", errors="replace"))
+        return {
+            "path": arguments.get("path"),
+            "content": f"<written to the sandbox: {size:,} bytes>",
+        }
+    return arguments
+
+
+def _history_result(name: str, result: dict[str, Any]) -> dict[str, Any]:
+    if name == "run_python":
+        trimmed: dict[str, Any] = {
+            "stdout": _elide(str(result.get("stdout", "")), HISTORY_OUTPUT_LIMIT),
+            "stderr": _elide(str(result.get("stderr", "")), HISTORY_OUTPUT_LIMIT),
+        }
+        if result.get("error"):
+            trimmed["error"] = result["error"]
+        return trimmed
+    if name == "read_file" and "content" in result:
+        return {**result, "content": _elide(str(result["content"]), HISTORY_FILE_LIMIT)}
+    return result
+
+
+@dataclass(frozen=True)
+class _FileRecovery:
+    """One recoverable output kind: which files qualify (extension plus magic
+    bytes where the format has a reliable signature), the artifact type they
+    register under, and the wording for user-facing recovery notices."""
+
+    artifact_type: str
+    signatures: dict[str, bytes | None]
+    ready: str
+    failed: str
+    exhausted: str
+    missing: str
+
+
+_FILE_RECOVERIES: dict[str, _FileRecovery] = {
+    "pdf": _FileRecovery(
+        artifact_type="pdf",
+        signatures={".pdf": b"%PDF-"},
+        ready="The PDF report is ready in the canvas.",
+        failed="I generated report work, but could not put a PDF on the canvas",
+        exhausted="I ran out of steps before I could finish the PDF report",
+        missing="no PDF artifact was found in the sandbox workspace",
+    ),
+    "slides": _FileRecovery(
+        artifact_type="slides",
+        signatures={".pptx": b"PK\x03\x04"},
+        ready="The slide deck is ready in the canvas.",
+        failed="I generated slide deck work, but could not put a deck on the canvas",
+        exhausted="I ran out of steps before I could finish the slide deck",
+        missing="no slide deck file was found in the sandbox workspace",
+    ),
+    "image": _FileRecovery(
+        artifact_type="image",
+        # PNG's leading byte is not valid UTF-8, so it cannot be verified
+        # through read_file's decoded content; the extension is the contract.
+        signatures={".png": None, ".svg": None},
+        ready="The chart is ready in the canvas.",
+        failed="I generated chart work, but could not put an image on the canvas",
+        exhausted="I ran out of steps before I could finish the chart",
+        missing="no chart image was found in the sandbox workspace",
+    ),
+    "data": _FileRecovery(
+        artifact_type="data",
+        signatures={".xlsx": b"PK\x03\x04", ".csv": None},
+        ready="The data export is ready in the canvas.",
+        failed="I generated export work, but could not put a file on the canvas",
+        exhausted="I ran out of steps before I could finish the data export",
+        missing="no export file was found in the sandbox workspace",
+    ),
+}
+
 # The kernel preloads WORKSPACE for convenience, but agent code can reassign it,
 # so this snippet resolves the real workspace from the sandbox environment. A
-# wrong destination would silently copy a rescued PDF back onto itself.
+# wrong destination would silently copy a rescued file back onto itself.
 # Scan roots default to known provider output locations (some providers
 # scratch-write under /tmp or /mnt/data); SANDBOX_RESCUE_ROOTS overrides the
 # list so tests never glob the host's real temp directory.
-PDF_RESCUE_CODE = """import os
+_RESCUE_TEMPLATE = """import os
 from pathlib import Path
 workspace = Path(os.environ.get("SANDBOX_WORKSPACE", "/workspace")).resolve()
 roots_override = os.environ.get("SANDBOX_RESCUE_ROOTS")
@@ -52,12 +146,14 @@ if roots_override:
     source_roots = [Path(part) for part in roots_override.split(os.pathsep) if part]
 else:
     source_roots = [Path.cwd(), Path("/app"), Path("/mnt/data"), Path("/tmp")]
+signatures = __SIGNATURES__
 candidates = []
 for source_root in source_roots:
-    try:
-        candidates.extend(source_root.glob("*.pdf"))
-    except OSError:
-        pass
+    for extension in signatures:
+        try:
+            candidates.extend(source_root.glob("*" + extension))
+        except OSError:
+            pass
 valid = []
 for source in candidates:
     try:
@@ -65,8 +161,10 @@ for source in candidates:
         if source.is_relative_to(workspace):
             continue
         data = source.read_bytes()
-        if data.startswith(b"%PDF-"):
-            valid.append((source.stat().st_mtime, source, data))
+        magic = signatures.get(source.suffix.lower())
+        if magic is not None and not data.startswith(magic):
+            continue
+        valid.append((source.stat().st_mtime, source, data))
     except OSError:
         pass
 if valid:
@@ -74,6 +172,23 @@ if valid:
     workspace.mkdir(parents=True, exist_ok=True)
     (workspace / source.name).write_bytes(data)
 """
+
+
+def _rescue_code(recovery: _FileRecovery) -> str:
+    """Kernel snippet that copies a stray output file into the workspace.
+
+    Only files of the requested kind are copied (extension, plus magic bytes
+    when the format has a reliable signature), never arbitrary host paths.
+    """
+    return _RESCUE_TEMPLATE.replace("__SIGNATURES__", repr(recovery.signatures))
+
+
+# Kept under its original name: the script exporter and tests recognize this
+# exact cell when replaying a trajectory.
+PDF_RESCUE_CODE = _rescue_code(_FILE_RECOVERIES["pdf"])
+# Every rescue variant, so the script exporter can skip internal plumbing
+# regardless of which output kind was recovered.
+RESCUE_CODES = frozenset(_rescue_code(recovery) for recovery in _FILE_RECOVERIES.values())
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "type": "function",
@@ -162,14 +277,15 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "register_artifact",
-            "description": "Register a generated HTML, PDF, image, spreadsheet, or other artifact for the canvas. "
+            "description": "Register a generated HTML, PDF, image, spreadsheet, slide deck, or other artifact for the canvas. "
             "For a webapp, register the served HTML file (for example dashboard.html or site/index.html). "
-            "For an Excel or CSV export, register the file with type data so the canvas offers it for download.",
+            "For an Excel or CSV export, register the file with type data so the canvas offers it for download. "
+            "For a PowerPoint deck, register the .pptx file with type slides.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "name": {"type": "string"},
-                    "type": {"type": "string", "enum": ["webapp", "pdf", "document", "image", "data"]},
+                    "type": {"type": "string", "enum": ["webapp", "pdf", "document", "image", "data", "slides"]},
                     "port": {"type": "integer"},
                 },
                 "required": ["name"],
@@ -240,6 +356,16 @@ with the filename and type "data" so the canvas offers the file for download.
 Prefer Excel for polished multi-column deliverables and CSV when the user
 asks for raw data. As with every artifact, only files inside the workspace
 can be downloaded, and the task is not complete until the file is registered.
+
+For slide-deck or presentation requests, build the deck with
+reportkit.Deck(title, subtitle, theme="light", accent="#2f6fed"): title_slide
+and section for structure, then slide(title) to start each content slide
+followed by kpi_row, prose, bullets, table, callout, chart, or figure, and
+finally build(Path(WORKSPACE) / "deck.pptx"). Then call register_artifact
+with the .pptx filename and type "slides". Compute every number on the slides
+from the uploaded data first, and keep slides terse: a few bullets or one
+visual each. As with every artifact, only files inside the workspace can be
+downloaded, and the task is not complete until the deck is registered.
 """
     if not dataset_profiles:
         return prompt + "\nNo dataset has been uploaded yet."
@@ -329,6 +455,9 @@ class MockProvider:
                 "tool": "register_artifact",
                 "arguments": {"name": "dashboard.html", "port": 8501, "type": "webapp"},
             }
+        elif any(term in prompt for term in ("pptx", "powerpoint", "slide", "deck", "presentation")):
+            yield {"tool": "run_python", "arguments": {"code": pptx_code()}}
+            yield {"tool": "register_artifact", "arguments": {"name": "deck.pptx", "type": "slides"}}
         elif "pdf" in prompt or "report" in prompt or "whitepaper" in prompt:
             yield {"tool": "run_python", "arguments": {"code": pdf_code()}}
             yield {"tool": "register_artifact", "arguments": {"name": "report.pdf", "type": "pdf"}}
@@ -344,7 +473,7 @@ class MockProvider:
         elif any(term in prompt for term in ("executive summary", "summary", "insight", "analy", "explore")):
             yield mock_executive_summary(messages)
         else:
-            yield "I can analyze the uploaded data, build a dashboard, or write a PDF report."
+            yield "I can analyze the uploaded data, build a dashboard, write a PDF report, or draft a slide deck."
 
 
 def excel_code() -> str:
@@ -410,6 +539,191 @@ for offset in offsets[1:]: pdf.extend(f"{offset:010d} 00000 n \n".encode())
 pdf.extend(f"trailer\n<< /Size {len(objects)+1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode())
 (workspace / "report.pdf").write_bytes(pdf)
 """
+
+
+def pptx_code() -> str:
+    # A dependency-free, valid two-slide PPTX keeps the offline mock usable in
+    # any environment, mirroring pdf_code(): a .pptx is a zip of OOXML parts,
+    # so zipfile plus string XML is enough.
+    return r'''import html
+import zipfile
+from pathlib import Path
+
+workspace = Path(WORKSPACE)
+frame = globals().get("df_1")
+rows = len(frame) if frame is not None else 0
+bullets = [f"{rows:,} rows analyzed"]
+if frame is not None:
+    for name in frame.select_dtypes(include="number").columns[:3]:
+        value = frame[name].mean()
+        if value == value:  # skip NaN averages
+            bullets.append(f"Average {name}: {value:,.2f}")
+
+NS = ('xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+      'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
+      'xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"')
+RT = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+PKG = "http://schemas.openxmlformats.org/package/2006/relationships"
+EMPTY_GROUP = ('<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>'
+               '<p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/>'
+               '<a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>')
+
+
+def text_shape(sid, name, x, y, cx, cy, lines, size, color, bold=False, align="l"):
+    runs = ""
+    for line in lines:
+        b = ' b="1"' if bold else ""
+        runs += (f'<a:p><a:pPr algn="{align}"/><a:r>'
+                 f'<a:rPr lang="en-US" sz="{size}"{b}>'
+                 f'<a:solidFill><a:srgbClr val="{color}"/></a:solidFill></a:rPr>'
+                 f'<a:t>{html.escape(line)}</a:t></a:r></a:p>')
+    return (f'<p:sp><p:nvSpPr><p:cNvPr id="{sid}" name="{name}"/>'
+            '<p:cNvSpPr><a:spLocks noGrp="1"/></p:cNvSpPr><p:nvPr/></p:nvSpPr>'
+            f'<p:spPr><a:xfrm><a:off x="{x}" y="{y}"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm>'
+            '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr>'
+            f'<p:txBody><a:bodyPr wrap="square"/><a:lstStyle/>{runs}</p:txBody></p:sp>')
+
+
+def fill_shape(sid, name, x, y, cx, cy, color):
+    return (f'<p:sp><p:nvSpPr><p:cNvPr id="{sid}" name="{name}"/>'
+            '<p:cNvSpPr/><p:nvPr/></p:nvSpPr>'
+            f'<p:spPr><a:xfrm><a:off x="{x}" y="{y}"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm>'
+            '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>'
+            f'<a:solidFill><a:srgbClr val="{color}"/></a:solidFill></p:spPr>'
+            '<p:txBody><a:bodyPr/><a:lstStyle/><a:p/></p:txBody></p:sp>')
+
+
+def slide_xml(shapes):
+    return ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            f'<p:sld {NS}><p:cSld><p:spTree>{EMPTY_GROUP}{shapes}</p:spTree></p:cSld></p:sld>')
+
+
+def rels_xml(entries):
+    body = "".join(
+        f'<Relationship Id="{rid}" Type="{RT}/{kind}" Target="{target}"/>'
+        for rid, kind, target in entries
+    )
+    return ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            f'<Relationships xmlns="{PKG}">{body}</Relationships>')
+
+
+title_slide = slide_xml(
+    fill_shape(2, "AccentBar", 5000445, 2010000, 2194560, 36576, "2F6FED")
+    + text_shape(3, "Title", 914400, 2286000, 10383520, 1280160,
+                 ["Data Copilot Slide Deck"], 4000, "1C2430", bold=True, align="ctr")
+    + text_shape(4, "Subtitle", 914400, 3620000, 10383520, 457200,
+                 ["Generated analysis summary"], 1800, "5B6672", align="ctr")
+    + text_shape(5, "Meta", 914400, 5181600, 10383520, 365760,
+                 ["Prepared by Data Copilot"], 1100, "5B6672", align="ctr")
+)
+findings_slide = slide_xml(
+    text_shape(2, "Title", 548640, 320040, 11094720, 731520,
+               ["Key findings"], 2600, "1C2430", bold=True)
+    + fill_shape(3, "AccentBar", 566928, 1024128, 1463040, 41148, "2F6FED")
+    + text_shape(4, "Bullets", 548640, 1280160, 11094720, 4572000,
+                 ["\u2022 " + item for item in bullets], 1600, "1C2430")
+)
+
+content_types = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+    '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+    '<Default Extension="xml" ContentType="application/xml"/>'
+    '<Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>'
+    '<Override PartName="/ppt/slideMasters/slideMaster1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml"/>'
+    '<Override PartName="/ppt/slideLayouts/slideLayout1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml"/>'
+    '<Override PartName="/ppt/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/>'
+    '<Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>'
+    '<Override PartName="/ppt/slides/slide2.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>'
+    '</Types>')
+
+presentation = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    f'<p:presentation {NS}>'
+    '<p:sldMasterIdLst><p:sldMasterId id="2147483648" r:id="rId1"/></p:sldMasterIdLst>'
+    '<p:sldIdLst><p:sldId id="256" r:id="rId2"/><p:sldId id="257" r:id="rId3"/></p:sldIdLst>'
+    '<p:sldSz cx="12192000" cy="6858000"/><p:notesSz cx="6858000" cy="9144000"/>'
+    '</p:presentation>')
+
+master = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    f'<p:sldMaster {NS}><p:cSld><p:spTree>{EMPTY_GROUP}</p:spTree></p:cSld>'
+    '<p:clrMap bg1="lt1" tx1="dk1" bg2="lt2" tx2="dk2" accent1="accent1" accent2="accent2" '
+    'accent3="accent3" accent4="accent4" accent5="accent5" accent6="accent6" '
+    'hlink="hlink" folHlink="folHlink"/>'
+    '<p:sldLayoutIdLst><p:sldLayoutId id="2147483649" r:id="rId1"/></p:sldLayoutIdLst>'
+    '<p:txStyles>'
+    '<p:titleStyle><a:lvl1pPr><a:defRPr sz="3200"/></a:lvl1pPr></p:titleStyle>'
+    '<p:bodyStyle><a:lvl1pPr><a:defRPr sz="1800"/></a:lvl1pPr></p:bodyStyle>'
+    '<p:otherStyle><a:lvl1pPr><a:defRPr sz="1800"/></a:lvl1pPr></p:otherStyle>'
+    '</p:txStyles></p:sldMaster>')
+
+layout = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    f'<p:sldLayout {NS} type="blank" preserve="1">'
+    f'<p:cSld name="Blank"><p:spTree>{EMPTY_GROUP}</p:spTree></p:cSld>'
+    '<p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sldLayout>')
+
+theme = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    '<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="Data Copilot">'
+    '<a:themeElements><a:clrScheme name="DataCopilot">'
+    '<a:dk1><a:srgbClr val="1C2430"/></a:dk1><a:lt1><a:srgbClr val="FFFFFF"/></a:lt1>'
+    '<a:dk2><a:srgbClr val="5B6672"/></a:dk2><a:lt2><a:srgbClr val="F2F5FA"/></a:lt2>'
+    '<a:accent1><a:srgbClr val="2F6FED"/></a:accent1><a:accent2><a:srgbClr val="5B6672"/></a:accent2>'
+    '<a:accent3><a:srgbClr val="D9DEE6"/></a:accent3><a:accent4><a:srgbClr val="1C2430"/></a:accent4>'
+    '<a:accent5><a:srgbClr val="2F6FED"/></a:accent5><a:accent6><a:srgbClr val="5B6672"/></a:accent6>'
+    '<a:hlink><a:srgbClr val="2F6FED"/></a:hlink><a:folHlink><a:srgbClr val="5B6672"/></a:folHlink>'
+    '</a:clrScheme>'
+    '<a:fontScheme name="DataCopilot">'
+    '<a:majorFont><a:latin typeface="Helvetica"/><a:ea typeface=""/><a:cs typeface=""/></a:majorFont>'
+    '<a:minorFont><a:latin typeface="Helvetica"/><a:ea typeface=""/><a:cs typeface=""/></a:minorFont>'
+    '</a:fontScheme>'
+    '<a:fmtScheme name="DataCopilot">'
+    '<a:fillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill>'
+    '<a:solidFill><a:schemeClr val="phClr"/></a:solidFill>'
+    '<a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:fillStyleLst>'
+    '<a:lnStyleLst>'
+    '<a:ln w="6350"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln>'
+    '<a:ln w="12700"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln>'
+    '<a:ln w="19050"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln>'
+    '</a:lnStyleLst>'
+    '<a:effectStyleLst><a:effectStyle><a:effectLst/></a:effectStyle>'
+    '<a:effectStyle><a:effectLst/></a:effectStyle>'
+    '<a:effectStyle><a:effectLst/></a:effectStyle></a:effectStyleLst>'
+    '<a:bgFillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill>'
+    '<a:solidFill><a:schemeClr val="phClr"/></a:solidFill>'
+    '<a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:bgFillStyleLst>'
+    '</a:fmtScheme></a:themeElements></a:theme>')
+
+parts = {
+    "[Content_Types].xml": content_types,
+    "_rels/.rels": rels_xml([("rId1", "officeDocument", "ppt/presentation.xml")]),
+    "ppt/presentation.xml": presentation,
+    "ppt/_rels/presentation.xml.rels": rels_xml([
+        ("rId1", "slideMaster", "slideMasters/slideMaster1.xml"),
+        ("rId2", "slide", "slides/slide1.xml"),
+        ("rId3", "slide", "slides/slide2.xml"),
+        ("rId4", "theme", "theme/theme1.xml"),
+    ]),
+    "ppt/slideMasters/slideMaster1.xml": master,
+    "ppt/slideMasters/_rels/slideMaster1.xml.rels": rels_xml([
+        ("rId1", "slideLayout", "../slideLayouts/slideLayout1.xml"),
+        ("rId2", "theme", "../theme/theme1.xml"),
+    ]),
+    "ppt/slideLayouts/slideLayout1.xml": layout,
+    "ppt/slideLayouts/_rels/slideLayout1.xml.rels": rels_xml([
+        ("rId1", "slideMaster", "../slideMasters/slideMaster1.xml"),
+    ]),
+    "ppt/theme/theme1.xml": theme,
+    "ppt/slides/slide1.xml": title_slide,
+    "ppt/slides/_rels/slide1.xml.rels": rels_xml([
+        ("rId1", "slideLayout", "../slideLayouts/slideLayout1.xml"),
+    ]),
+    "ppt/slides/slide2.xml": findings_slide,
+    "ppt/slides/_rels/slide2.xml.rels": rels_xml([
+        ("rId1", "slideLayout", "../slideLayouts/slideLayout1.xml"),
+    ]),
+}
+with zipfile.ZipFile(workspace / "deck.pptx", "w", zipfile.ZIP_DEFLATED) as bundle:
+    for part_name, part_xml in parts.items():
+        bundle.writestr(part_name, part_xml)
+'''
 
 
 def chart_code() -> str:
@@ -840,65 +1154,115 @@ class Agent:
             lowered,
         ) is not None
 
+    # The slides/chart/data classifiers mirror MockProvider's routing keywords,
+    # so the offline provider and the recovery gates agree on what was asked for.
     @staticmethod
-    def _is_pdf_artifact(artifact: dict[str, Any]) -> bool:
+    def _is_slides_request(content: str) -> bool:
+        lowered = content.lower()
+        return any(
+            term in lowered
+            for term in ("pptx", "powerpoint", "slide", "deck", "presentation")
+        )
+
+    @staticmethod
+    def _is_chart_request(content: str) -> bool:
+        lowered = content.lower()
+        return any(term in lowered for term in ("chart", "graph", "plot", "visuali"))
+
+    @staticmethod
+    def _is_data_export_request(content: str) -> bool:
+        lowered = content.lower()
+        return any(
+            term in lowered
+            for term in (
+                "excel",
+                "xlsx",
+                "spreadsheet",
+                "to csv",
+                "as csv",
+                "csv export",
+                "export csv",
+            )
+        )
+
+    @staticmethod
+    def _artifact_kind(artifact: dict[str, Any]) -> str | None:
+        """Map a registered artifact to its recovery category: explicit type
+        first, file extension second."""
         path = str(artifact.get("path") or artifact.get("name") or "").lower()
-        return artifact.get("type") == "pdf" or path.endswith(".pdf")
+        for kind, recovery in _FILE_RECOVERIES.items():
+            if artifact.get("type") == recovery.artifact_type or path.endswith(
+                tuple(recovery.signatures)
+            ):
+                return kind
+        return None
 
-    async def _recover_pdf_artifact(self) -> tuple[dict[str, Any] | None, str | None]:
-        """Recover a PDF when a provider wrote it but omitted the handoff.
+    async def _recover_file_artifact(
+        self, kind: str
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Recover a file artifact when a provider wrote it but omitted the handoff.
 
-        Only a real PDF found in the sandbox is published. When the provider
-        never wrote one, the caller says so instead of fabricating a document
-        from raw tool output.
+        Only a real file of the requested kind found in the sandbox is
+        published. When the provider never wrote one, the caller says so
+        instead of fabricating an artifact from raw tool output.
         """
-        async def find_pdf() -> str | None:
+        recovery = _FILE_RECOVERIES[kind]
+
+        async def find_file() -> str | None:
             listing = await self.dispatcher.dispatch("list_files", {"path": "."})
             files = listing.get("files", [])
-            for item in files:
-                if (
-                    not isinstance(item, dict)
-                    or item.get("directory")
-                    or int(item.get("size", 0) or 0) < 5
-                    or not str(item.get("path", "")).lower().endswith(".pdf")
-                ):
-                    continue
-                try:
-                    result = await self.dispatcher.dispatch(
-                        "read_file",
-                        {"path": str(item["path"])},
-                    )
-                    if str(result.get("content", "")).startswith("%PDF-"):
-                        return str(item["path"])
-                except Exception:
-                    continue
+            for extension, magic in recovery.signatures.items():
+                for item in files:
+                    if (
+                        not isinstance(item, dict)
+                        or item.get("directory")
+                        or int(item.get("size", 0) or 0) < 5
+                    ):
+                        continue
+                    path = str(item.get("path", ""))
+                    # Uploaded datasets live in data/ and are inputs, not deliverables.
+                    if path.startswith("data/") or not path.lower().endswith(extension):
+                        continue
+                    if magic is None:
+                        return path
+                    try:
+                        result = await self.dispatcher.dispatch(
+                            "read_file",
+                            {"path": path},
+                        )
+                        if str(result.get("content", "")).startswith(
+                            magic.decode("utf-8", errors="replace")
+                        ):
+                            return path
+                    except Exception:
+                        continue
             return None
 
         try:
-            pdf_path = await find_pdf()
+            path = await find_file()
             # Providers occasionally write their output to the working directory,
             # /mnt/data, or /tmp. Copy only those known runtime output locations,
             # never arbitrary host paths, into the persisted workspace.
-            if not pdf_path and not hasattr(self.dispatcher.sandbox, "root"):
-                await self.dispatcher.dispatch("run_python", {"code": PDF_RESCUE_CODE})
-                pdf_path = await find_pdf()
-            if not pdf_path:
-                return None, "no PDF artifact was found in the sandbox workspace"
+            if not path and not hasattr(self.dispatcher.sandbox, "root"):
+                await self.dispatcher.dispatch("run_python", {"code": _rescue_code(recovery)})
+                path = await find_file()
+            if not path:
+                return None, recovery.missing
             artifact_result = await self.dispatcher.dispatch(
                 "register_artifact",
-                {"name": Path(pdf_path).name, "type": "pdf"},
+                {"name": Path(path).name, "type": recovery.artifact_type},
             )
             artifact = next(
                 (
                     item
                     for item in artifact_result.get("artifacts", [])
-                    if self._is_pdf_artifact(item)
+                    if self._artifact_kind(item) == kind
                 ),
                 None,
             )
             if not artifact:
-                return None, "the recovered PDF could not be registered"
-            artifact["type"] = "pdf"
+                return None, f"the recovered {recovery.artifact_type} file could not be registered"
+            artifact["type"] = recovery.artifact_type
             return artifact, None
         except Exception as exc:
             return None, str(exc)
@@ -1064,10 +1428,19 @@ class Agent:
             ]
             final_text = ""
             dashboard_request = self._is_dashboard_request(content)
-            report_request = self._is_report_request(content)
-            # Tracked per category so a combined dashboard+report turn gates each
-            # recovery path below on its own artifact kind.
-            published_pdf = False
+            # File-artifact kinds the user asked for; a combined turn (say,
+            # dashboard + slide deck) gates and recovers each kind on its own.
+            requested_kinds = [
+                kind
+                for kind, requested in (
+                    ("pdf", self._is_report_request(content)),
+                    ("slides", self._is_slides_request(content)),
+                    ("image", self._is_chart_request(content)),
+                    ("data", self._is_data_export_request(content)),
+                )
+                if requested
+            ]
+            published_kinds: set[str] = set()
             published_webapp = False
             started_ports: dict[int, str] = {}
             # The nudge is folded into the latest tool result rather than sent
@@ -1164,18 +1537,20 @@ class Agent:
                             is_webapp = bool(
                                 artifact.get("type") == "webapp" and artifact.get("port")
                             )
-                            is_pdf = self._is_pdf_artifact(artifact)
-                            # A turn can ask for a dashboard AND a report: match
-                            # each artifact to its own category rather than
-                            # requiring every artifact to satisfy both gates.
-                            if dashboard_request and report_request:
-                                if not (is_webapp or is_pdf):
+                            kind = self._artifact_kind(artifact)
+                            # A turn can ask for several outputs at once: match
+                            # each artifact to its own category and keep
+                            # intermediate files (charts embedded in a deck,
+                            # scratch CSVs) off the canvas.
+                            if dashboard_request or requested_kinds:
+                                wanted = (dashboard_request and is_webapp) or (
+                                    kind is not None and kind in requested_kinds
+                                )
+                                if not wanted:
                                     continue
-                            elif dashboard_request and not is_webapp or report_request and not is_pdf:
-                                continue
                             artifact = dict(artifact)
-                            if report_request and is_pdf:
-                                artifact["type"] = "pdf"
+                            if kind is not None:
+                                artifact["type"] = _FILE_RECOVERIES[kind].artifact_type
                             if dashboard_request and is_webapp and artifact.get("path"):
                                 command = started_ports.get(int(artifact["port"]), "")
                                 artifact["path"] = self._static_preview_path(
@@ -1184,8 +1559,8 @@ class Agent:
                                 )
                             if is_webapp:
                                 published_webapp = True
-                            if is_pdf:
-                                published_pdf = True
+                            if kind is not None:
+                                published_kinds.add(kind)
                             yield {
                                 "type": "artifact",
                                 "name": artifact.get("name"),
@@ -1197,6 +1572,9 @@ class Agent:
                 if not tool_calls:
                     steps_exhausted = False
                     break
+                # History hygiene: the client stream and trajectory already
+                # carry the full payloads; the running prompt keeps only the
+                # compacted arguments and elided results from here on.
                 request_messages.append(
                     {
                         "role": "assistant",
@@ -1207,7 +1585,9 @@ class Agent:
                                 "type": "function",
                                 "function": {
                                     "name": name,
-                                    "arguments": json.dumps(arguments),
+                                    "arguments": json.dumps(
+                                        _history_arguments(name, arguments)
+                                    ),
                                 },
                             }
                             for call_id, name, arguments, _ in tool_calls
@@ -1220,11 +1600,17 @@ class Agent:
                             "role": "tool",
                             "tool_call_id": call_id,
                             "name": name,
-                            "content": json.dumps(result, default=str),
+                            "content": json.dumps(
+                                _history_result(name, result), default=str
+                            ),
                         }
                     )
-            if report_request and not published_pdf:
-                recovered, recovery_error = await self._recover_pdf_artifact()
+            unrecovered_kinds = [
+                kind for kind in requested_kinds if kind not in published_kinds
+            ]
+            for kind in unrecovered_kinds:
+                recovery = _FILE_RECOVERIES[kind]
+                recovered, recovery_error = await self._recover_file_artifact(kind)
                 if recovered:
                     self.dispatcher.record(
                         {"type": "artifact_recovered", "artifact": recovered}
@@ -1236,24 +1622,21 @@ class Agent:
                         "artifact": recovered,
                     }
                     final_text = (
-                        f"{final_text}\n\nThe PDF report is ready in the canvas."
+                        f"{final_text}\n\n{recovery.ready}"
                         if final_text
-                        else "The PDF report is ready in the canvas."
+                        else recovery.ready
                     )
                 elif steps_exhausted:
                     notice = (
-                        "I ran out of steps before I could finish the PDF report, "
+                        f"{recovery.exhausted}, "
                         "so nothing was published to the canvas. Ask me to "
                         "continue and I'll pick up where I left off."
                     )
                     final_text = f"{final_text}\n\n{notice}" if final_text else notice
                 else:
-                    notice = (
-                        "I generated report work, but could not put a PDF on the "
-                        f"canvas: {recovery_error}."
-                    )
+                    notice = f"{recovery.failed}: {recovery_error}."
                     final_text = f"{final_text}\n\n{notice}" if final_text else notice
-            elif steps_exhausted and not dashboard_request:
+            if steps_exhausted and not dashboard_request and not unrecovered_kinds:
                 notice = (
                     "I ran out of steps before finishing, so this answer may be "
                     "incomplete. Ask me to continue and I'll pick up where I "

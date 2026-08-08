@@ -28,6 +28,7 @@ from pydantic import BaseModel, Field
 
 from .agent import Agent, AnthropicProvider, MockProvider, OpenAIProvider
 from .config import Settings, get_settings
+from .export import build_analysis_script
 from .profiling import profile_files
 from .proxy import preview_target
 from .sandbox import SessionManager
@@ -264,6 +265,7 @@ def _restored_artifacts(
         ".xlsx": "data",
         ".xls": "data",
         ".csv": "data",
+        ".pptx": "slides",
     }
     restored: list[dict[str, Any]] = []
     for item in scanned:
@@ -378,6 +380,24 @@ def create_app(settings: Settings | None = None, manager: SessionManager | None 
             raise HTTPException(404, "artifact not found") from exc
         media_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
         return Response(content=content, media_type=media_type)
+
+    @application.get("/api/sessions/{session_id}/export/script")
+    async def export_script(session_id: str) -> Response:
+        try:
+            session = session_manager.get(session_id)
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        script = build_analysis_script(
+            Path(settings.sessions_dir) / session_id / "trajectory.jsonl",
+            session.dataset_profiles,
+            session_id,
+        )
+        filename = f"data-copilot-analysis-{session_id[:8]}.py"
+        return Response(
+            content=script,
+            media_type="text/x-python",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
 
     @application.delete("/api/sessions/{session_id}", status_code=204)
     async def delete_session(session_id: str) -> Response:

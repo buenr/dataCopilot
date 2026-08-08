@@ -30,6 +30,8 @@ pythonpath = ["backend"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+# Scratch output from manual E2E runs (exported scripts, decks) is not repo code.
+exclude = ["test-artifacts"]
 
 [tool.ruff.lint]
 # Security heuristics (S) are owned by bandit + semgrep. B008 fires on FastAPI's
@@ -50,6 +52,7 @@ build-backend = "hatchling.build"
 dev = [
     "bandit>=1.9.4",
     "matplotlib>=3.11.1",
+    "python-pptx>=1.0",
     "reportlab>=5.0.0",
     "ruff>=0.16.2",
     "semgrep>=1.172.0",
